@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AFTER — Day One</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+
+      <!-- ===================== HUD ===================== -->
+      <div id="hud" class="hidden">
+        <div id="vignette"></div>
+        <div id="damage-flash"></div>
+        <div id="night-tint"></div>
+
+        <!-- top-left: objective -->
+        <div id="objective-panel">
+          <div class="obj-label">OBJECTIVE</div>
+          <div id="obj-text">—</div>
+          <div id="obj-sub"></div>
+        </div>
+
+        <!-- top-right: clock + day -->
+        <div id="clock-panel">
+          <div id="clock-time">--:--</div>
+          <div id="clock-phase">—</div>
+        </div>
+
+        <!-- bottom-left: vitals -->
+        <div id="vitals">
+          <div class="bar-row">
+            <span class="bar-icon hp">✚</span>
+            <div class="bar"><div id="bar-health" class="fill health"></div></div>
+          </div>
+          <div class="bar-row">
+            <span class="bar-icon st">⚡</span>
+            <div class="bar thin"><div id="bar-stamina" class="fill stamina"></div></div>
+          </div>
+          <div class="bar-row small">
+            <span class="bar-icon th">💧</span>
+            <div class="bar thin"><div id="bar-thirst" class="fill thirst"></div></div>
+          </div>
+          <div class="bar-row small">
+            <span class="bar-icon hu">🍖</span>
+            <div class="bar thin"><div id="bar-hunger" class="fill hunger"></div></div>
+          </div>
+        </div>
+
+        <!-- bottom-right: weapon -->
+        <div id="weapon-panel">
+          <div id="weapon-name">FISTS</div>
+          <div id="weapon-sub">bare hands</div>
+          <!-- condition: three pips, one per band, draining right to left -->
+          <div id="weapon-cond" class="hidden">
+            <span class="pip"></span><span class="pip"></span><span class="pip"></span>
+            <span id="cond-word">pristine</span>
+          </div>
+          <div id="ammo-line" class="hidden"><span id="ammo-count">0</span> rounds</div>
+        </div>
+
+        <!-- center: crosshair-ish + interaction -->
+        <div id="reticle"></div>
+        <!-- iron sights: the gap between the marks is the sway you are fighting -->
+        <div id="ads-reticle" class="hidden">
+          <i class="t"></i><i class="b"></i><i class="l"></i><i class="r"></i>
+        </div>
+        <div id="interact-prompt" class="hidden">
+          <span class="key">E</span><span id="interact-text">Search</span>
+        </div>
+        <div id="search-progress" class="hidden"><div id="search-fill"></div></div>
+
+        <!-- status effects -->
+        <div id="status-strip"></div>
+
+        <!-- noise indicator -->
+        <div id="noise-meter" title="How much noise you are making">
+          <div id="noise-fill"></div>
+        </div>
+
+        <!-- stealth eye: fills with the attention of whatever is closest to
+             noticing you, so being about to be seen is something you can feel -->
+        <div id="stealth-eye" class="hidden" title="How close something is to seeing you">
+          <svg viewBox="0 0 40 24" aria-hidden="true">
+            <path id="eye-outline" d="M2 12 Q20 1 38 12 Q20 23 2 12 Z" />
+            <clipPath id="eye-clip"><path d="M2 12 Q20 1 38 12 Q20 23 2 12 Z" /></clipPath>
+            <g clip-path="url(#eye-clip)">
+              <rect id="eye-fill" x="0" y="24" width="40" height="24" />
+            </g>
+            <circle id="eye-pupil" cx="20" cy="12" r="4.2" />
+          </svg>
+        </div>
+
+        <!-- toasts -->
+        <div id="toasts"></div>
+        <div id="subtitle"></div>
+
+        <!-- threat directional indicators get injected here -->
+        <div id="threat-layer"></div>
+      </div>
+
+      <!-- ===================== INVENTORY ===================== -->
+      <div id="inventory" class="hidden">
+        <div class="inv-window">
+          <div class="inv-header">
+            <div class="inv-title">PACK</div>
+            <div class="inv-hint">[1-9] use · [Q] drop · [TAB/I] close</div>
+          </div>
+          <div class="inv-body">
+            <div id="inv-grid"></div>
+            <div id="inv-detail">
+              <div id="inv-detail-name">—</div>
+              <div id="inv-detail-desc">Select an item.</div>
+              <div id="inv-detail-stats"></div>
+              <div id="inv-detail-actions"></div>
+            </div>
+          </div>
+          <div class="inv-footer">
+            <div class="inv-stat"><span>HEALTH</span><b id="inv-hp">100</b></div>
+            <div class="inv-stat"><span>THIRST</span><b id="inv-th">100</b></div>
+            <div class="inv-stat"><span>HUNGER</span><b id="inv-hu">100</b></div>
+            <div class="inv-stat"><span>WEIGHT</span><b id="inv-wt">0/0</b></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================== SCREENS ===================== -->
+      <div id="screen-title" class="screen">
+        <div class="title-bg"></div>
+        <div class="title-inner">
+          <h1>AFTER</h1>
+          <div class="subtitle-main">day one</div>
+          <p class="blurb">
+            The sirens stopped around noon. Nobody came.<br />
+            Find what you can before dark, and get somewhere with a door that locks.
+          </p>
+          <button id="btn-start">BEGIN</button>
+          <div class="controls-hint">
+            <div><b>WASD</b> move · <b>SHIFT</b> sprint · <b>SPACE</b> jump · <b>MOUSE</b> look</div>
+            <div><b>LMB</b> attack · <b>RMB</b> block · <b>E</b> interact/search · <b>F</b> flashlight</div>
+            <div><b>TAB</b> inventory · <b>1-9</b> quick-use · <b>ESC</b> release cursor</div>
+          </div>
+          <div class="warn">Uses audio. Click BEGIN to enable sound.</div>
+        </div>
+      </div>
+
+      <div id="screen-death" class="screen hidden">
+        <div class="death-inner">
+          <h1 id="death-title">YOU DIED</h1>
+          <p id="death-cause">Torn apart on the street.</p>
+          <div id="death-stats"></div>
+          <button id="btn-retry">TRY AGAIN</button>
+        </div>
+      </div>
+
+      <div id="screen-win" class="screen hidden">
+        <div class="win-inner">
+          <h1>DAWN</h1>
+          <p id="win-text">You made it through the first night.</p>
+          <div id="win-stats"></div>
+          <button id="btn-again">PLAY AGAIN</button>
+        </div>
+      </div>
+
+      <div id="screen-loading" class="screen">
+        <div class="loading-inner">
+          <div class="load-title">AFTER</div>
+          <div class="load-bar"><div id="load-fill"></div></div>
+          <div id="load-text">building the neighbourhood…</div>
+        </div>
+      </div>
+
+      <div id="pause-hint" class="hidden">PAUSED — click to resume</div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
