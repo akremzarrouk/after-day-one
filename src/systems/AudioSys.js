@@ -912,4 +912,76 @@ export class AudioSys {
     this.tone({ freq: 294, type: 'sine', dur: 3.0, gain: 0.1, delay: 0.5, reverb: 0.85 });
     this.tone({ freq: 392, type: 'sine', dur: 3.4, gain: 0.08, delay: 1.0, reverb: 0.85 });
   }
+
+  // ────────────────────────────────────────────────── metagame kit ──
+
+  /**
+   * The radio's carrier wave. Narrow band noise with a slow sweep, so it
+   * reads as a set that is nearly but not quite tuned in — the sound of a
+   * thing that might be about to say something.
+   */
+  radioHiss(x, z, strength = 1) {
+    const sp = x === undefined ? { gain: 1, pan: 0 } : this.spatial(x, z, CFG_HISS_ROLLOFF);
+    if (sp.gain <= 0.02) return;
+    this.noiseBurst({
+      dur: 1.5,
+      type: 'bandpass',
+      freq: 1500 + Math.random() * 900,
+      q: 2.6,
+      gain: 0.05 * strength * sp.gain,
+      pan: sp.pan,
+      reverb: 0.2,
+      sweepTo: 900,
+    });
+  }
+
+  /**
+   * A syllable of somebody a long way away. Deliberately not words: the text
+   * on screen is the transcript, and this is what you would actually hear
+   * through that much distance and that much weather.
+   */
+  radioVoice(x, z, pitch = 1) {
+    const sp = x === undefined ? { gain: 1, pan: 0 } : this.spatial(x, z, CFG_HISS_ROLLOFF);
+    if (sp.gain <= 0.02) return;
+    const base = 240 * pitch;
+    this.noiseBurst({
+      dur: 0.34,
+      type: 'bandpass',
+      freq: base * 3.4,
+      q: 5.5,
+      gain: 0.1 * sp.gain,
+      pan: sp.pan,
+      reverb: 0.25,
+      sweepTo: base * 2.2,
+    });
+    this.tone({ freq: base, type: 'sawtooth', dur: 0.22, gain: 0.03 * sp.gain, pan: sp.pan, slideTo: base * 0.82 });
+  }
+
+  /** One cycle of a small petrol engine. Called on the generator's own timer. */
+  generatorPutt(x, z) {
+    const sp = this.spatial(x, z, 34);
+    if (sp.gain <= 0.02) return;
+    this.tone({ freq: 62, type: 'square', dur: 0.5, gain: 0.05 * sp.gain, pan: sp.pan, reverb: 0.3 });
+    this.noiseBurst({ dur: 0.5, type: 'lowpass', freq: 320, gain: 0.05 * sp.gain, pan: sp.pan, reverb: 0.25 });
+  }
+
+  /** Three cans on a string, all at once. The whole point is that it carries. */
+  alarmCans(x, z) {
+    const sp = this.spatial(x, z, 40);
+    for (let i = 0; i < 5; i++) {
+      this.noiseBurst({
+        dur: 0.13,
+        type: 'bandpass',
+        freq: 2200 + Math.random() * 2600,
+        q: 7,
+        gain: 0.2 * (0.4 + sp.gain),
+        pan: sp.pan,
+        delay: i * 0.055 + Math.random() * 0.03,
+        reverb: 0.4,
+      });
+    }
+  }
 }
+
+/** How far the radio carries. Kept beside the sounds that use it. */
+const CFG_HISS_ROLLOFF = 15;

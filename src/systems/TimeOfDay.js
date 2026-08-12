@@ -281,6 +281,14 @@ export class TimeOfDay {
     this._sunDir = new THREE.Vector3();
     this.lightLevel = 1;
     this.streetlightsOn = false;
+
+    /**
+     * Multiplier on fog density, set from outside. The night the grid dies it
+     * ramps to a little over two, which closes the street down to the length
+     * of a torch beam — the sky palette does not change at all, because what
+     * changed is the air and not the hour.
+     */
+    this.fogBoost = 1;
   }
 
   get isNight() {
@@ -371,7 +379,7 @@ export class TimeOfDay {
     this.ambient.intensity = ambI * LIGHT_SCALE;
 
     this.scene.fog.color.copy(fogCol);
-    this.scene.fog.density = fogD;
+    this.scene.fog.density = fogD * this.fogBoost;
     this.renderer.setClearColor(fogCol);
 
     const wantLights = this.lightLevel < 0.42;
@@ -384,5 +392,6 @@ export class TimeOfDay {
     this.hour = CFG.time.startHour;
     this.day = 1;
     this.elapsedHours = 0;
+    this.fogBoost = 1;
   }
 }

@@ -32,8 +32,13 @@ import { Throwables } from '../systems/Throwables.js';
 import { Fire } from '../systems/Fire.js';
 import { TimeOfDay } from '../systems/TimeOfDay.js';
 import { AudioSys } from '../systems/AudioSys.js';
-import { Objectives, Goal } from '../systems/Objectives.js';
-import { ITEMS, ItemType, WEAPONS, rollLoot } from '../systems/Items.js';
+import { Objectives } from '../systems/Objectives.js';
+import { Run, RunState } from '../systems/Run.js';
+import { Base } from '../systems/Base.js';
+import { Radio } from '../systems/Radio.js';
+import * as Save from '../systems/Save.js';
+import { ITEMS, ItemType, WEAPONS } from '../systems/Items.js';
+import { OpeningState } from '../world/Openings.js';
 
 import { HUD } from '../ui/HUD.js';
 
@@ -214,6 +219,16 @@ export class Game {
     this.inventory = new Inventory(22);
     this.objectives = new Objectives(this.world);
 
+    /**
+     * The metagame layer. `Run` owns the five-day clock and everything that
+     * happens between nights, `Base` owns what you build, and `Radio` owns
+     * the only story the game tells. None of the three knows about the other
+     * two — this class is still the only place systems meet.
+     */
+    this.run = new Run(this.world);
+    this.base = new Base(this.scene, this.world);
+    this.radio = new Radio(this.world.radioSpot || {});
+
     this.player = new Player(
       this.scene,
       this.world,
@@ -257,11 +272,63 @@ export class Game {
     await step(0.9, 'the neighbours…');
     this.resetRun();
 
+    await step(0.96, 'warming the lamps…');
+    this._warmShaders();
+
     await step(1.0, 'ready');
     this.hud.hideLoading();
     this.state = GameState.TITLE;
-    this.hud.showTitle();
+    this.hud.showTitle(Save.peek());
     this._loop();
+  }
+
+  /**
+   * Compile the shaders the run is going to need, while there is still a
+   * loading bar to hide it behind.
+   *
+   * three.js writes the light count into every material's program, so the
+   * first frame that changes it recompiles the lot. There are three
+   * configurations this game reaches: the ordinary street, the street plus a
+   * fire, and the street plus the yard floodlights. Left cold, each one costs
+   * a 150–220 ms lurch at precisely the moment it happens — the molotov you
+   * just threw, the generator you just started. Two extra compile passes here
+   * buys all of them.
+   */
+  _warmShaders() {
+    const flood = this.world.generator?.lights || [];
+    const sun = this.time.sun;
+    const sunShadow = sun.castShadow;
+
+    /**
+     * `renderer.compile()` is not enough — measured, it adds no programs for a
+     * light set it has not actually drawn. Only a real frame through the same
+     * composer the game uses does the work, so that is what this does: draw
+     * one throwaway frame per configuration, behind the loading screen.
+     */
+    const draw = () => {
+      try {
+        this._render(0.016);
+      } catch (e) {
+        /* a driver that will not pre-warm still runs, just with the hitch */
+      }
+    };
+
+    for (const withFire of [false, true]) {
+      this.fire.warmLights(withFire);
+      for (const withFlood of [false, true]) {
+        if (withFlood) for (const l of flood) this.world.root.add(l);
+        // Sun shadows switch off after dusk, and that is a program variant too
+        // — otherwise the lurch just moves to the first evening.
+        for (const shadow of [true, false]) {
+          sun.castShadow = shadow;
+          draw();
+        }
+        if (withFlood) for (const l of flood) this.world.root.remove(l);
+      }
+    }
+
+    this.fire.warmLights(false);
+    sun.castShadow = sunShadow;
   }
 
   resetRun() {
@@ -269,6 +336,9 @@ export class Game {
     this.inventory.slots.length = 0;
     this.inventory.equipped = 'fists';
     this.objectives.reset();
+    this.run.reset();
+    this.base.reset();
+    this.radio.reset();
     this.horde.reset();
     this.time.reset();
     this.time.timeScale = 1;
@@ -287,8 +357,11 @@ export class Game {
     this.pickupMeshes.length = 0;
     this.world.interactables = this.world.interactables.filter((i) => i.type !== 'pickup');
     for (const it of this.world.interactables) it.used = false;
+    this.world.resetContainers();
     this.world.notesRead.clear();
     this.world.resetOpenings();
+    this.world.blackout = 0;
+    this.world.convoyOn = false;
 
     this.player.spawn(this.world.playerSpawn);
     this.cameraRig.yaw = Math.PI;
@@ -314,6 +387,13 @@ export class Game {
     document.getElementById('btn-again').onclick = () => this.restart();
     document.getElementById('pause-hint').onclick = () => this.input.requestLock();
 
+    /**
+     * CONTINUE only exists when there is a run to continue. A dead run has
+     * already deleted its own save, so the button is not a way back into one.
+     */
+    const cont = document.getElementById('btn-continue');
+    if (cont) cont.onclick = () => this.continueGame();
+
     this.input.onLockChange((locked) => {
       if (this.state === GameState.PLAYING) {
         this.hud.setPaused(!locked && !this.hud.inventoryOpen);
@@ -332,11 +412,35 @@ export class Game {
     this.input.requestLock();
     this.clock.getDelta();
     this.audio.levelStinger();
+    Save.clear();
     this.hud.subtitle(
       'Two days since the radio stopped. You have until dark to find something worth having.',
       7
     );
     this.hud.toast('warn', 'Objective: find supplies before nightfall.');
+  }
+
+  /**
+   * Pick a run back up.
+   *
+   * The snapshot is applied over a freshly reset run, so anything the save
+   * deliberately does not store — the horde, the corpses, the blood on the
+   * pavement — comes back as a new street rather than as a stale one.
+   */
+  continueGame() {
+    this.resetRun();
+    if (!Save.apply(this)) {
+      this.hud.toast('bad', 'That save could not be read.');
+      return this.startGame();
+    }
+    this.audio.init();
+    this.audio.resume();
+    this.hud.hideTitle();
+    this.state = GameState.PLAYING;
+    this.started = true;
+    this.input.requestLock();
+    this.clock.getDelta();
+    this.hud.subtitle(`Day ${this.run.day}. You are still here.`, 5);
   }
 
   restart() {
@@ -559,6 +663,14 @@ export class Game {
 
     const target = this.world.findInteractable(p.pos.x, p.pos.z);
 
+    // Walking away mid-hold has to cancel the hold. Without this, stepping
+    // back from the generator with E down and returning later pours a jerry
+    // can in the instant you arrive.
+    if (!target || target.type !== 'generator') {
+      this._genHold = 0;
+      this._genFired = false;
+    }
+
     if (this.searchTarget) {
       const t = this.searchTarget;
       const moved = p.speed > 0.9;
@@ -648,14 +760,169 @@ export class Game {
       this.hud.setPrompt(`Hide — ${target.label.toLowerCase()}`);
       if (this.input.pressed('KeyE')) this._enterHide(target);
     } else if (target.type === 'rest') {
-      const canRest = this.time.hour >= 20 || this.time.hour < 5.5;
-      if (!canRest) {
-        this.hud.setPrompt('Too early to sleep');
-        return;
-      }
-      this.hud.setPrompt('Rest until dawn');
-      if (this.input.pressed('KeyE')) this._startRest();
+      this._restPrompt(target);
+    } else if (target.type === 'stash') {
+      const stash = this.base.stashFor(target.shelterId);
+      this.hud.setPrompt(`${target.label} — ${stash.slots.length ? `${stash.weight.toFixed(0)} kg inside` : 'empty'}`);
+      if (this.input.pressed('KeyE')) this._openStash(target);
+    } else if (target.type === 'radio') {
+      this._radioPrompt();
+    } else if (target.type === 'generator') {
+      this._generatorPrompt(dt);
     }
+  }
+
+  // ────────────────────────────────────────────── sleep, stash, radio ──
+
+  /**
+   * Sleeping through a night is the strongest move available, so the prompt
+   * is where the gate lives, and it always says the specific thing that is
+   * wrong. "The kitchen window is still out" is an instruction; "you cannot
+   * sleep here" is a wall.
+   */
+  _restPrompt(target) {
+    const R = CFG.run;
+    // Only from the last of the light until the first of it. Sleeping through
+    // the dawn grace window would be sleeping through the safest two hours of
+    // the run, which is the one thing a survivor would never do.
+    const canRest = this.time.hour >= R.duskWarn || this.time.hour < R.dawnStart;
+    if (!canRest) {
+      this.hud.setPrompt('Too much daylight left to waste on sleeping');
+      return;
+    }
+    const check = this.run.canSleep({ world: this.world, horde: this.horde, player: this.player });
+    if (!check.ok) {
+      this.hud.setPrompt(`Cannot sleep — ${check.reason.toLowerCase()}`);
+      return;
+    }
+    this.hud.setPrompt('Sleep until dawn');
+    if (this.input.pressed('KeyE')) this._startRest(check.shelter);
+  }
+
+  _openStash(target) {
+    this.stashTarget = this.base.stashFor(target.shelterId);
+    // Opening the box in a place is how you say the place is yours.
+    const shelter = this.world.shelterById(target.shelterId);
+    if (shelter && !this.run.shelter) this.run.claim(shelter);
+    this.hud.openStash(this.stashTarget, target.label);
+    this.input.exitLock();
+    this.audio.uiClick();
+  }
+
+  _closeStash() {
+    if (!this.stashTarget) return;
+    this.stashTarget = null;
+    this.hud.closeStash();
+    this._interactLock = 0.35;
+  }
+
+  /**
+   * Pack → box. Weapons carry their condition across, which matters: the
+   * stash is where a worn axe waits for the tool roll you have not found yet.
+   */
+  stashDeposit(i) {
+    const stash = this.stashTarget;
+    const slot = this.inventory.slots[i];
+    if (!stash || !slot) return;
+    const stored = stash.add(slot.id, slot.count, slot.cond ?? null);
+    if (stored <= 0) {
+      this.hud.toast('warn', 'The box is full.');
+      this.audio.uiBad();
+      return;
+    }
+    const wasEquipped = ITEMS[slot.id]?.weapon === this.inventory.equipped;
+    this.inventory.removeAtIndex(i, stored);
+    if (wasEquipped && !this.inventory.slots.some((s) => ITEMS[s.id]?.weapon === this.inventory.equipped)) {
+      this.inventory.equipWeapon(this.inventory.bestWeaponId());
+    }
+    this.audio.uiClick();
+  }
+
+  /** Box → pack, and the weight cap gets the final say as always. */
+  stashWithdraw(i) {
+    const stash = this.stashTarget;
+    if (!stash) return;
+    const slot = stash.slots[i];
+    if (!slot) return;
+    const room = this.inventory.add(slot.id, slot.count, slot.cond ?? null);
+    if (room <= 0) {
+      this.hud.toast('warn', 'No room in your pack.');
+      this.audio.uiBad();
+      return;
+    }
+    stash.removeAtIndex(i, room);
+    this.audio.uiClick();
+  }
+
+  _radioPrompt() {
+    if (this.radio.playing) {
+      this.hud.setPrompt('…listening');
+      return;
+    }
+    if (!this.radio.hasSignal) {
+      const last = this.radio.lastHeardDay;
+      this.hud.setPrompt(last ? 'Radio — dead air' : 'Radio — nothing but static');
+      return;
+    }
+    this.hud.setPrompt('Listen to the radio');
+    if (this.input.pressed('KeyE') && this.radio.listen()) {
+      this.run.stats.fragments++;
+      this.audio.uiClick();
+    }
+  }
+
+  /**
+   * The generator. A tap is the cord; a hold is a jerry can. Both are loud,
+   * and one of them keeps being loud for four minutes.
+   */
+  _generatorPrompt(dt) {
+    const gen = this.base.generator;
+    if (!gen) return;
+    const hasFuel = this.inventory.has('fuel');
+    const mins = Math.floor(gen.fuel / 60);
+    const secs = Math.floor(gen.fuel % 60);
+    const fuelText = gen.fuel > 0 ? `${mins}:${String(secs).padStart(2, '0')} of fuel` : 'dry';
+
+    const tap = gen.running ? 'Shut it down' : gen.fuel > 0 ? 'Pull the cord' : null;
+    const hold = hasFuel ? 'Pour in a can' : null;
+    this.hud.setPrompt(
+      `Generator · ${fuelText}${tap ? ` — ${tap}` : ''}${hold ? ' · hold: fill it' : ''}`
+    );
+
+    if (this.input.down('KeyE')) {
+      this._genHold = (this._genHold || 0) + dt;
+      if (hold && !this._genFired && this._genHold >= 1.6) {
+        this._genFired = true;
+        this.inventory.remove('fuel', 1);
+        gen.refuel(CFG.base.generator.fuelPerCan);
+        this.audio.rustle(gen.x, gen.z);
+        this.hud.toast('good', 'Fuel in. It will not last as long as you think.');
+      }
+      if (hold && !this._genFired) this.hud.setSearchProgress(this._genHold / 1.6);
+    } else {
+      if (this._genHold > 0 && !this._genFired && tap) this._toggleGenerator();
+      this._genHold = 0;
+      this._genFired = false;
+      this.hud.setSearchProgress(null);
+    }
+  }
+
+  _toggleGenerator() {
+    const gen = this.base.generator;
+    if (!gen) return;
+    if (gen.running) {
+      gen.stop();
+      this.hud.toast('', 'The engine dies. Your eyes take a moment.');
+      return;
+    }
+    if (gen.fuel <= 0) {
+      this.hud.toast('warn', 'Nothing in the tank.');
+      this.audio.uiBad();
+      return;
+    }
+    gen.start({ noise: this.noise, audio: this.audio });
+    this.hud.toast('warn', 'It catches. The whole street can hear that.');
+    this.hud.subtitle('The yard floods with light. So does everything looking at it.', 4);
   }
 
   /** The nearest thing lying at your feet that a boot would settle. */
@@ -686,33 +953,124 @@ export class Game {
    *
    * @returns null when the opening offers nothing.
    */
+  /**
+   * The best fortification you could put on this opening right now.
+   *
+   * Upgrades first, highest affordable tier wins, and patching a damaged
+   * barricade back to full only comes up when there is nothing better on
+   * offer. Returning the *cost* alongside the tier is what lets the prompt say
+   * "hold: reinforce it (1 planks, 1 tool roll)" instead of making you find
+   * out by holding the key.
+   */
+  _costText(cost) {
+    return Object.entries(cost)
+      .map(([id, n]) => `${n}× ${ITEMS[id]?.short || id}`)
+      .join(' + ');
+  }
+
+  /**
+   * The one thing holding E on this opening will do.
+   *
+   * Deliberately one action per state rather than a menu, because the
+   * interaction model only has one timed slot and a doorway is not a place to
+   * read a list:
+   *
+   *   not boarded        → board it, at the best tier you can afford
+   *   boarded + damaged  → nail it back together at the tier it already has
+   *   boarded + intact   → pull the boards off
+   *
+   * Upgrading planks to steel is therefore two deliberate actions — take the
+   * old barricade down, put the better one up — which is both more honest
+   * than planks turning into a metal sheet and the reason there is always a
+   * way out of a building you sealed yourself into.
+   */
+  _fortifyAction(op) {
+    const tiers = CFG.base.fortify;
+    const affordable = (t) => !this.base.missingFor(t.cost, this.inventory);
+
+    if (op.state === OpeningState.BOARDED) {
+      const cur = tiers[op.tier] || tiers[0];
+      if (op.boardHp < op.boardMax - 1 && affordable(cur)) {
+        return {
+          label: `Nail it back together (${this._costText(cur.cost)})`,
+          time: cur.time,
+          bar: true,
+          run: () => this._fortifyOpening(op, { level: op.tier, tier: cur, patch: true }),
+        };
+      }
+      return {
+        label: 'Pull the boards off',
+        time: CFG.base.unboardTime,
+        bar: true,
+        run: () => this._unboardOpening(op),
+      };
+    }
+
+    for (let i = tiers.length - 1; i >= 0; i--) {
+      if (affordable(tiers[i])) {
+        const verb = i === 0 ? 'Board it up' : `Board it up — ${tiers[i].name.toLowerCase()}`;
+        return {
+          label: `${verb} (${this._costText(tiers[i].cost)})`,
+          time: tiers[i].time,
+          bar: true,
+          run: () => this._fortifyOpening(op, { level: i, tier: tiers[i] }),
+        };
+      }
+    }
+    return null;
+  }
+
   _openingActions(op) {
     const O = CFG.openings;
-    const planks = this.inventory.has('planks');
     const acts = { tap: null, hold: null, note: null };
 
+    if (op.state === OpeningState.BROKEN) {
+      /**
+       * A hole is not a door. Before you can board it you have to make it a
+       * frame again, and that costs twice the wood — which is the entire
+       * reason the corner store is the harder place to hold.
+       */
+      const can = this.inventory.count('planks') >= CFG.base.repairPlankCost;
+      acts.note = op.isDoor ? 'The door is off its hinges' : 'Smashed out';
+      if (can) {
+        acts.hold = {
+          label: `Rebuild the frame (${CFG.base.repairPlankCost}× Planks)`,
+          time: CFG.base.repairTime,
+          bar: true,
+          run: () => this._repairOpening(op),
+        };
+      }
+      if (!op.isDoor) {
+        acts.tap = { label: 'Climb through', run: () => this._vault(op) };
+      }
+      return acts.tap || acts.hold ? acts : acts.note ? acts : null;
+    }
+
+    // Nothing above this line can be fortified, so the cost of working out
+    // what fortifying would offer is only paid where it can be taken up.
+    const fort = this._fortifyAction(op);
+
     if (op.isDoor) {
-      if (op.state === 'closed') {
+      if (op.state === OpeningState.CLOSED) {
         acts.tap = { label: 'Open the door', run: () => this._useDoor(op) };
-        if (planks) acts.hold = { label: 'Board it up', time: O.boardTime, bar: true, run: () => this._boardOpening(op) };
-      } else if (op.state === 'open') {
+        acts.hold = fort;
+      } else if (op.state === OpeningState.OPEN) {
         acts.tap = { label: 'Close the door', run: () => this._useDoor(op) };
         acts.hold = { label: 'Slam it', time: O.slamHoldTime, bar: false, run: () => this._slamDoor(op) };
-      } else if (op.state === 'boarded') {
-        acts.note = 'Boarded shut';
       } else {
-        acts.note = 'The door is off its hinges';
+        acts.note = `${op.tierName || 'Boarded'} · ${Math.round((op.boardHp / op.boardMax) * 100)}%`;
+        acts.hold = fort;
       }
     } else {
-      if (op.state === 'boarded') {
-        acts.note = 'Boarded over';
+      if (op.state === OpeningState.BOARDED) {
+        acts.note = `${op.tierName || 'Boarded'} · ${Math.round((op.boardHp / op.boardMax) * 100)}%`;
+        acts.hold = fort;
       } else {
-        const glass = op.state === 'closed';
         acts.tap = {
-          label: glass ? 'Climb through (breaks the glass)' : 'Climb through',
+          label: op.state === OpeningState.CLOSED ? 'Climb through (breaks the glass)' : 'Climb through',
           run: () => this._vault(op),
         };
-        if (planks) acts.hold = { label: 'Board it up', time: O.boardTime, bar: true, run: () => this._boardOpening(op) };
+        acts.hold = fort;
       }
     }
     if (!acts.tap && !acts.hold) return acts.note ? acts : null;
@@ -762,7 +1120,8 @@ export class Game {
       this._opHoldFired = false;
     }
 
-    const hint = acts.hold ? `${acts.tap ? acts.tap.label : ''} · hold: ${acts.hold.label}` : acts.tap.label;
+    const head = acts.tap ? acts.tap.label : acts.note ? `${op.label()} — ${acts.note}` : '';
+    const hint = acts.hold ? `${head}${head ? ' · ' : ''}hold: ${acts.hold.label}` : head;
     this.hud.setPrompt(hint);
     return true;
   }
@@ -783,16 +1142,71 @@ export class Game {
     this.hud.toast('warn', 'That was loud.');
   }
 
-  _boardOpening(op) {
-    if (!this.inventory.has('planks')) return;
-    if (!op.board()) return;
-    this.inventory.remove('planks', CFG.openings.boardPlankCost);
+  _fortifyOpening(op, f) {
+    const missing = this.base.missingFor(f.tier.cost, this.inventory);
+    if (missing) {
+      this.hud.toast('warn', `You are out of ${missing.toLowerCase()}.`);
+      this.audio.uiBad();
+      return;
+    }
+    if (!op.fortify(f.level)) return;
+    this.base.spend(f.tier.cost, this.inventory);
+    this.run.stats.built++;
+
     this.audio.hammer(op.x, op.z);
     setTimeout(() => this.audio.hammer(op.x, op.z), 180);
+    if (f.level >= 2) setTimeout(() => this.audio.impact('hit_metal', op.x, op.z), 380);
     this.noise.emit(op.x, op.z, CFG.noise.barricade, 'player', 'barricade');
-    this.hud.toast('good', `${op.isDoor ? 'Door' : 'Window'} boarded.`);
+
+    const what = op.isDoor ? 'Door' : 'Window';
+    this.hud.toast(
+      'good',
+      f.patch ? `${what} patched up.` : f.level === 0 ? `${what} boarded.` : `${what}: ${f.tier.name.toLowerCase()}.`
+    );
     this.hud.setSearchProgress(null);
     if (op === this.world.safehouse?.doorOpening) this.objectives.onBarricade();
+  }
+
+  /** The original single-tier call, kept for the test suites that use it. */
+  _boardOpening(op) {
+    this._fortifyOpening(op, { level: 0, tier: CFG.base.fortify[0] });
+  }
+
+  /**
+   * Prise the barricade off. Loud enough that doing it at three in the morning
+   * is a decision, and it hands the materials back so the only real cost is
+   * everything within eighteen metres knowing about it.
+   */
+  _unboardOpening(op) {
+    const refund = op.unboard();
+    if (!refund) return;
+    const got = this.inventory.add(refund, 1);
+    this.audio.woodBreak(op.x, op.z);
+    setTimeout(() => this.audio.hammer(op.x, op.z), 160);
+    this.noise.emit(op.x, op.z, CFG.base.unboardNoise, 'player', 'barricade');
+    this.hud.setSearchProgress(null);
+    this.hud.toast(
+      got > 0 ? '' : 'warn',
+      got > 0 ? `Boards off. ${ITEMS[refund].name} back in the pack.` : 'Boards off — no room to carry them.'
+    );
+  }
+
+  /**
+   * Rebuilding a smashed frame. Twice the wood and twice the time of an
+   * ordinary boarding, and the result is only a closed door — you still have
+   * to board it afterwards if you want it to hold anything.
+   */
+  _repairOpening(op) {
+    if (this.inventory.count('planks') < CFG.base.repairPlankCost) return;
+    if (!op.repair()) return;
+    this.inventory.remove('planks', CFG.base.repairPlankCost);
+    this.run.stats.built++;
+    this.audio.hammer(op.x, op.z);
+    setTimeout(() => this.audio.hammer(op.x, op.z), 200);
+    setTimeout(() => this.audio.hammer(op.x, op.z), 420);
+    this.noise.emit(op.x, op.z, CFG.noise.barricade * 1.3, 'player', 'barricade');
+    this.hud.toast('good', `${op.isDoor ? 'Door' : 'Window'} back in its frame.`);
+    this.hud.setSearchProgress(null);
   }
 
   _vault(op) {
@@ -967,12 +1381,20 @@ export class Game {
       return;
     }
 
-    t.used = true;
     this.stats.searched++;
-    // Luck rises slightly as the day goes on so late runs aren't hopeless.
-    const luck = 1 + clamp01((this.time.elapsedHours - 2) / 14) * 0.35;
-    const rolled = rollLoot(t.table, this.rng, luck);
-    if (t.guaranteed) {
+    this.run.stats.searched++;
+
+    /**
+     * The container decides what it has left, not the clock: `richness` is a
+     * pool of searches, and a restocked one rolls thin. A guaranteed item only
+     * ever comes out of the very first search this container ever gets —
+     * `looted` and not `used`, because a dawn restock makes a container
+     * un-`used` again and must not turn one cupboard into a knife dispenser
+     * for five days.
+     */
+    const first = !t.looted;
+    const rolled = this.run.rollContainer(t, this.rng);
+    if (t.guaranteed && first) {
       const [id, n] = Array.isArray(t.guaranteed) ? t.guaranteed : [t.guaranteed, 1];
       rolled.unshift({ id, count: n });
     }
@@ -984,12 +1406,23 @@ export class Game {
     for (const r of rolled) this.giveItem(r.id, r.count);
   }
 
-  _startRest() {
+  /**
+   * Sleep.
+   *
+   * The night is not skipped, it is fast-forwarded — the horde, the director,
+   * the hunting parties and anything chewing on your boards all keep running
+   * at nine times speed, and any of them can wake you. That is the difference
+   * between a shelter being safe and a shelter being a gamble you have already
+   * finished making.
+   */
+  _startRest(shelter) {
     this.resting = true;
     this.restStart = this.time.hour;
-    this.time.timeScale = 9;
+    this.time.timeScale = CFG.run.sleepTimeScale;
+    this.run.slept++;
+    if (shelter) this.run.claim(shelter);
     this.hud.subtitle('You close your eyes. Every sound outside is very clear.', 4);
-    this.hud.toast('', 'Resting…');
+    this.hud.toast('', 'Sleeping…');
   }
 
   _stopRest(reason) {
@@ -1016,20 +1449,45 @@ export class Game {
     if (this.state !== GameState.PLAYING) return;
 
     if (inp.pressed('Tab') || inp.pressed('KeyI')) {
-      const open = this.hud.toggleInventory();
       this.audio.uiClick();
-      if (open) this.input.exitLock();
-      else this.input.requestLock();
+      if (this.hud.stashOpen) {
+        // Tab at a box shuts the box. Toggling on top of that would close the
+        // stash and immediately reopen the plain pack, which reads as the key
+        // having done nothing.
+        this._closeStash();
+        this.input.requestLock();
+      } else {
+        const open = this.hud.toggleInventory();
+        if (open) this.input.exitLock();
+        else this.input.requestLock();
+      }
     }
 
     if (inp.pressed('Escape')) {
       if (this.hud.inventoryOpen) {
+        this._closeStash();
         this.hud.closeInventory();
         this.input.requestLock();
       }
     }
 
     if (this.hud.inventoryOpen) {
+      /**
+       * Standing at a box, every key that moves an item moves it into the box.
+       * `Q` dropping your food on the floor of the room you are storing it in
+       * is never what the player meant, and quick-using a medkit through the
+       * number row while looking at a chest is not either.
+       */
+      if (this.hud.stashOpen) {
+        if (inp.pressed('KeyQ')) this.stashDeposit(this.hud.selectedSlot);
+        for (let i = 0; i < 9; i++) {
+          if (inp.pressed(`Digit${i + 1}`)) {
+            this.hud.selectedSlot = i;
+            this.stashDeposit(i);
+          }
+        }
+        return;
+      }
       if (inp.pressed('KeyQ')) this.dropSlot(this.hud.selectedSlot);
       for (let i = 0; i < 9; i++) {
         if (inp.pressed(`Digit${i + 1}`)) {
@@ -1046,6 +1504,10 @@ export class Game {
     }
 
     if (inp.pressed('KeyF')) this.player.toggleFlashlight();
+    // The two build keys. Contextual and cheap: they either work where you
+    // are standing or they tell you why they do not.
+    if (inp.pressed('KeyG')) this._tryBuildTrap();
+    if (inp.pressed('KeyB')) this._tryBuildAlarm();
     if (inp.pressed('KeyX')) {
       const w = this.inventory.cycleWeapon(1);
       this.hud.toast('', `${WEAPONS[w].name}`);
@@ -1181,15 +1643,60 @@ export class Game {
       this.player.die(this.survival.deathCause);
     }
 
+    // ── the run ──
+    this.run.stats.distance = this.stats.distance;
+    this.run.update(dt, {
+      time: this.time,
+      player: this.player,
+      rng: this.rng,
+      radio: this.radio,
+      onDawn: (day) => this._onDawn(day),
+      onNightBegin: (n, curve) => this._onNightBegin(n, curve),
+    });
+    for (const ev of this.run.drain()) {
+      this.hud.toast(ev.kind, ev.text);
+      if (ev.big) this.hud.subtitle(ev.text, 6);
+    }
+
+    // The grid, the headlights, and the fog that comes with the dark.
+    this.world.blackout = this.run.blackout;
+    this.world.convoyOn = this.run.extractionOpen;
+    this.time.fogBoost = 1 + this.run.blackout * (CFG.blackout.fogMul - 1);
+
+    this.radio.update(dt, { audio: this.audio, cfg: CFG.radio });
+    for (const ev of this.radio.drain()) {
+      if (ev.big) this.hud.subtitle(ev.text, 4);
+      else this.hud.toast(ev.kind, ev.text);
+    }
+
     // ── world / AI ──
     this.noise.update(dt);
     this.world.nav.update();
     this.world.update(dt, this.time, this.player.pos);
 
+    const curve = this.run.curve;
     const hordeCtx = {
       player: this.player,
       night,
       playerConcealed: this._concealed,
+
+      /**
+       * Everything the campaign layer tells the director. It is deliberately
+       * flat data — a curve, a day number, a shelter and a flag — so that
+       * `Horde` still knows nothing about runs, radios or extractions.
+       */
+      curve,
+      speedMul: curve.speed,
+      // Bodies move in real seconds; the director thinks in game hours. While
+      // you are asleep the clock is the thing that is moving.
+      simScale: this.time.timeScale,
+      grace: this.run.inGrace,
+      runDay: this.run.day,
+      shelter: this.run.shelter || this.world.shelterById('safehouse'),
+      holdNear: this.run.extractionOpen
+        ? { x: CFG.run.extractPoint.x, z: CFG.run.extractPoint.z, r: CFG.run.extractRadius * 4 }
+        : null,
+      onSiegeWarning: (from) => this._onSiegeWarning(from),
       /**
        * The director gates every special on the clock, so it needs the clock.
        * `pastFirstDusk` is the brute's gate: it does not exist until the light
@@ -1216,6 +1723,25 @@ export class Game {
     };
     this.horde.update(dt, hordeCtx);
     this.stats.kills = this.horde.killCount;
+    this.run.stats.kills = this.horde.killCount;
+
+    // ── what you built ──
+    this.base.update(dt, {
+      horde: this.horde,
+      player: this.player,
+      noise: this.noise,
+      audio: this.audio,
+      night,
+    });
+    for (const ev of this.base.drain()) this._onBaseEvent(ev);
+    if (this.base.generator?.running) {
+      this.run.stats.generatorSeconds += dt;
+      this._genPutt = (this._genPutt || 0) - dt;
+      if (this._genPutt <= 0) {
+        this._genPutt = 0.55;
+        this.audio.generatorPutt(this.base.generator.x, this.base.generator.z);
+      }
+    }
 
     this.particles.update(dt);
     this.throwables.update(dt);
@@ -1245,12 +1771,18 @@ export class Game {
       if (threat.closest < 9 && this.horde.countChasing() > 0) {
         this._stopRest('Something is close.');
       }
-      if (this.time.hour >= 6.1 && this.time.hour < 12) this._stopRest(null);
+      if (this.time.hour >= CFG.run.dawnStart && this.time.hour < 12) this._stopRest(null);
       if (this.survival.thirst <= 3 || this.survival.hunger <= 3) this._stopRest('You cannot sleep like this.');
     }
 
     // ── objectives ──
-    this.objectives.update(dt, { time: this.time, player: this.player, world: this.world });
+    this.objectives.update(dt, {
+      time: this.time,
+      player: this.player,
+      world: this.world,
+      run: this.run,
+      radio: this.radio,
+    });
     for (const ev of this.objectives.drain()) {
       this.hud.toast(ev.kind, ev.text);
       if (ev.big) this.hud.subtitle(ev.text, 6);
@@ -1272,16 +1804,143 @@ export class Game {
     if (this.player.state === PlayerState.DEAD && this.player.deathTimer > 2.6) {
       this._enterDeath();
     }
-    if (this.objectives.goal === Goal.DONE) {
+    if (this.run.state === RunState.EXTRACTED || this.run.state === RunState.STRANDED) {
       this._enterWin();
     }
 
     this.hud.update(dt, this._hudState());
   }
 
+  // ─────────────────────────────────────────────────────── campaign beats ──
+
+  /**
+   * Dawn. The chapter break: the run has already ticked the day over, put a
+   * thin roll back into a quarter of the empty containers and asked the radio
+   * whether anybody is talking. All that is left here is the light, the
+   * sound, and writing the whole thing down.
+   */
+  _onDawn(day) {
+    this.audio.dawnStinger();
+    this._stopRest(null);
+    Save.save(this);
+    this.hud.flashDay(day);
+  }
+
+  /**
+   * Night falls. The escalation announces itself through the world — a hunting
+   * party groaning from a bearing, the streetlights going out one block at a
+   * time — so all this does is put a low note under it. The only thing the HUD
+   * ever says about a night is which number it is.
+   */
+  _onNightBegin(n, curve) {
+    this.audio.levelStinger();
+  }
+
+  _onSiegeWarning(from) {
+    const dx = from.x - this.player.pos.x;
+    const dz = from.z - this.player.pos.z;
+    this.hud.pingAlarm(Math.atan2(dx, dz), 'siege', CFG.siege.telegraph);
+    this.hud.subtitle('Something large is moving, and it is moving this way.', 5);
+  }
+
+  /**
+   * Something you built did its job. Traps report as a bearing and a toast;
+   * the alarm reports only as a bearing, because the whole product it sells
+   * is knowing which way to look.
+   */
+  _onBaseEvent(ev) {
+    if (ev.kind === 'alarm') {
+      const dx = ev.fromX - this.player.pos.x;
+      const dz = ev.fromZ - this.player.pos.z;
+      this.hud.pingAlarm(Math.atan2(dx, dz), 'alarm', CFG.base.alarm.pingTime);
+      this.audio.alarmCans(ev.x, ev.z);
+      this.run.stats.alarmTriggers++;
+      if (ev.spent) this.hud.toast('warn', 'The wire comes down.');
+      return;
+    }
+    if (ev.kind === 'nailboard') {
+      this.run.stats.trapTriggers++;
+      if (ev.killed) this.run.stats.trapKills++;
+      this.cameraRig.addShake(0.12);
+      if (ev.spent) this.hud.toast('warn', 'The nailboard is flat. It was worth it.');
+      return;
+    }
+    if (ev.kind === 'generator-dry') {
+      this.hud.toast('bad', 'The generator coughs and stops.');
+      this.hud.subtitle('The lights go. Your eyes have to start again from nothing.', 4);
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────── crafting ──
+
+  /**
+   * The two things you can build that are not part of a wall.
+   *
+   * Both are placed where you are standing rather than through a menu: a
+   * nailboard goes in the doorway you are in, and a wire of cans goes across
+   * whatever gap you are standing in. If you are in the wrong place the
+   * prompt says so and nothing is spent.
+   */
+  _tryBuildTrap() {
+    const N = CFG.base.nailboard;
+    const op = this.world.openingNear(this.player.pos.x, this.player.pos.z, 2.4);
+    if (!op) {
+      this.hud.toast('warn', 'A nailboard only means anything in a doorway.');
+      this.audio.uiBad();
+      return;
+    }
+    if (this.base.deviceNear(op.x, op.z, 1.5, 'nailboard')) {
+      this.hud.toast('warn', 'There is already one down there.');
+      this.audio.uiBad();
+      return;
+    }
+    const missing = this.base.missingFor(N.craft, this.inventory);
+    if (missing) {
+      this.hud.toast('warn', `No ${missing.toLowerCase()}.`);
+      this.audio.uiBad();
+      return;
+    }
+    this.base.spend(N.craft, this.inventory);
+    /**
+     * On *your* side of the doorway, so the thing coming through steps on it
+     * and you do not. `standPoint(outside)` wants the side you are already
+     * standing on, which is exactly what `isOutside` answers — inverting it
+     * lays the board on the far side of the wall, where nothing you are
+     * defending against will ever meet it.
+     */
+    const mySide = op.standPoint(op.isOutside(this.player.pos.x, this.player.pos.z), 0.75);
+    this.base.build('nailboard', mySide.x, mySide.z, Math.atan2(op.nz, op.nx));
+    this.run.stats.built++;
+    this.audio.hammer(op.x, op.z);
+    this.noise.emit(op.x, op.z, CFG.noise.barricade, 'player', 'barricade');
+    this.hud.toast('good', 'Nailboard down. Mind your own feet.');
+  }
+
+  _tryBuildAlarm() {
+    const A = CFG.base.alarm;
+    const p = this.player.pos;
+    if (this.base.deviceNear(p.x, p.z, A.radius * 0.8, 'alarm')) {
+      this.hud.toast('warn', 'Another wire this close would only tell you the same thing.');
+      this.audio.uiBad();
+      return;
+    }
+    const missing = this.base.missingFor(A.craft, this.inventory);
+    if (missing) {
+      this.hud.toast('warn', `No ${missing.toLowerCase()}.`);
+      this.audio.uiBad();
+      return;
+    }
+    this.base.spend(A.craft, this.inventory);
+    this.base.build('alarm', p.x, p.z, this.player.yaw + Math.PI / 2);
+    this.run.stats.built++;
+    this.audio.rustle(p.x, p.z);
+    this.hud.toast('good', 'Cans on a string. Now you will hear it coming.');
+  }
+
   _hudState() {
     const p = this.player;
     const night = this.time.lightLevel < 0.34;
+    const shelter = this.world.shelterAt(p.pos.x, p.pos.z);
     const threats = [];
     if (this.horde) {
       for (const z of this.horde.zombies) {
@@ -1323,24 +1982,82 @@ export class Game {
       indoors: !!this.world.isInside(p.pos.x, p.pos.z),
       barricaded: !!this.world.safehouse?.barricaded,
       threats,
+
+      // ── the run ──
+      day: this.run.day,
+      nightNo: this.run.night,
+      runPhase: this.run.phaseLabel,
+      sheltered: shelter?.name || null,
+      /**
+       * Nothing can walk into the building you are standing in. This is the
+       * single fact that decides whether you can sleep, so it earns a chip —
+       * counting doors yourself in the dark of a store with six openings is
+       * not a skill the game is trying to test.
+       */
+      sealed:
+        !!shelter &&
+        shelter.openings.every(
+          (o) => o.state !== OpeningState.BROKEN && !(o.isDoor && o.state === OpeningState.OPEN)
+        ),
+      claimed: this.run.shelter?.id || null,
+      generator: this.base.generator
+        ? { running: this.base.generator.running, fuel: this.base.generator.fuel }
+        : null,
+      radioSignal: this.radio.hasSignal,
+      blackout: this.run.blackout,
+      // Alarm bearings are stored as compass headings and resolved against
+      // this every frame, so they keep pointing at the thing while you turn.
+      camYaw: this.cameraRig.yaw,
     };
   }
 
+  /**
+   * Permadeath.
+   *
+   * There is one run and it is over. The save is deleted here rather than on
+   * the retry button, so alt-F4 at the moment of death is not a mechanic —
+   * the summary is the last thing that run produces.
+   */
   _enterDeath() {
     if (this.state === GameState.DEAD) return;
     this.state = GameState.DEAD;
+    this.run.state = RunState.DEAD;
     this._stopRest(null);
     this.input.exitLock();
     this.hud.setPrompt(null);
     this.hud.setSearchProgress(null);
-    const s = this.stats;
-    const survived = this.time.elapsedHours;
-    this.hud.showDeath(
-      this._deathLine(this.survival.deathCause),
-      `SURVIVED <b>${survived.toFixed(1)} hours</b> · died at <b>${this.time.clockString}</b><br>
-       PUT DOWN <b>${s.kills}</b> · SEARCHED <b>${s.searched}</b> places · FOUND <b>${s.itemsFound}</b> items<br>
-       WALKED <b>${Math.round(s.distance)}</b> metres`
-    );
+    this._closeStash();
+    Save.clear();
+    this.hud.showDeath(this._deathLine(this.survival.deathCause), this._runSummary('died'));
+  }
+
+  /**
+   * The run, written out.
+   *
+   * Every number here is one a player could have changed by deciding
+   * something differently — nights held, doors boarded, litres of petrol
+   * burned — which is what a run summary is for. Nothing in it is a score.
+   */
+  _runSummary(how) {
+    const r = this.run;
+    const s = r.stats;
+    const gen = Math.round(s.generatorSeconds);
+    const genLine = gen > 0 ? `RAN THE GENERATOR <b>${Math.floor(gen / 60)}m ${gen % 60}s</b><br>` : '';
+    const built = s.built > 0 ? `BOARDED &amp; BUILT <b>${s.built}</b> times<br>` : '';
+    const traps =
+      s.trapTriggers + s.alarmTriggers > 0
+        ? `TRAPS SPRUNG <b>${s.trapTriggers}</b> · ALARMS <b>${s.alarmTriggers}</b><br>`
+        : '';
+    const heard =
+      s.fragments > 0
+        ? `HEARD <b>${s.fragments}</b> of ${this.radio.total} transmissions<br>`
+        : 'HEARD <b>nothing</b> on the radio<br>';
+    const where = how === 'died' ? `died on <b>day ${r.day}</b> at <b>${this.time.clockString}</b>` : `<b>day ${r.day}</b>`;
+
+    return `NIGHTS SURVIVED <b>${r.nightsSurvived}</b> · ${where}<br>
+      ${built}${traps}${genLine}${heard}
+      PUT DOWN <b>${s.kills}</b> · SEARCHED <b>${s.searched}</b> places · SLEPT <b>${r.slept}</b> times<br>
+      WALKED <b>${Math.round(this.stats.distance)}</b> metres over <b>${this.time.elapsedHours.toFixed(1)}</b> hours`;
   }
 
   _deathLine(cause) {
@@ -1355,21 +2072,30 @@ export class Game {
     return lines[cause] || 'The first night got you.';
   }
 
+  /**
+   * The two endings.
+   *
+   * Reaching the convoy is the win the campaign is built toward. Missing it
+   * and being alive on the sixth morning anyway is the other one — not a
+   * failure screen, because five nights is five nights, but the game is
+   * allowed to be honest about which of the two you got.
+   */
   _enterWin() {
     if (this.state === GameState.WIN) return;
     this.state = GameState.WIN;
     this._stopRest(null);
     this.input.exitLock();
+    this._closeStash();
     this.audio.dawnStinger();
-    const s = this.stats;
-    const inside = this.world.isInSafehouse(this.player.pos.x, this.player.pos.z);
+    Save.clear();
+
+    const extracted = this.run.state === RunState.EXTRACTED;
     this.hud.showWin(
-      inside
-        ? 'Grey light through the boards. The street is quiet in the way streets are quiet<br>when nothing is left alive on them.'
-        : 'The sun comes up and finds you still outside, still standing.<br>You are not sure that counts as luck.',
-      `SURVIVED THE FIRST NIGHT · <b>${this.time.elapsedHours.toFixed(1)} hours</b><br>
-       PUT DOWN <b>${s.kills}</b> · SEARCHED <b>${s.searched}</b> places · FOUND <b>${s.itemsFound}</b> items<br>
-       HEALTH REMAINING <b>${Math.round(this.survival.health)}</b> · WALKED <b>${Math.round(s.distance)}</b> m`
+      extracted
+        ? 'Somebody puts a hand down off the tailgate and you take it.<br>The road goes north and the town goes small behind you.'
+        : 'Six mornings. The road north is empty tarmac and tyre marks.<br>You are still here, which was never the same thing as getting out.',
+      this._runSummary('lived'),
+      extracted ? 'EXTRACTED' : 'LEFT BEHIND'
     );
   }
 

@@ -1156,7 +1156,12 @@ export class Zombie {
     }
 
     const A = this.archetype;
-    const nightMul = ctx.night ? CFG.zombie.nightSpeedMul : 1;
+    /**
+     * Night is faster, and the *fifth* night is faster than the first. The
+     * per-night multiplier arrives in the context rather than being looked up
+     * here, because a zombie has no business knowing what a campaign is.
+     */
+    const nightMul = ctx.night ? CFG.zombie.nightSpeedMul * (ctx.speedMul || 1) : 1;
 
     /**
      * AI level of detail.

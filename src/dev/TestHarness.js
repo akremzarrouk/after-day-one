@@ -126,6 +126,9 @@ export function installHarness(game) {
         weapon: game.inventory.equipped,
         goal: game.objectives.goal,
         supplies: game.objectives.suppliesFound,
+        day: game.run.day,
+        rphase: game.run.phase,
+        rstate: game.run.state,
         errs: errs.length,
         lastErr: errs[errs.length - 1] || null,
       };
@@ -232,6 +235,86 @@ export function installHarness(game) {
       return m.runAll(H, opts);
     },
 
+    /**
+     * Run the metagame suite: the per-night escalation curves, secure-sleep
+     * gating, the nailboard's life and death, an alarm bearing, the
+     * generator's noise-for-light trade, the radio's four fragments, the
+     * economy table against the real loot tables, a save/reload round trip,
+     * a full five-day run at ninety times speed with a shot at every dawn,
+     * the extraction, and a deliberate death. Screenshots land in `.shots/`.
+     */
+    async metaTests(opts = {}) {
+      const m = await import('./MetaTests.js');
+      return m.runAll(H, opts);
+    },
+
+    /** Where the run is, in one line. */
+    run() {
+      const r = game.run;
+      return {
+        day: r.day,
+        phase: r.phase,
+        night: r.night,
+        state: r.state,
+        curve: r.curve,
+        shelter: r.shelter?.id || null,
+        blackout: +r.blackout.toFixed(2),
+        convoy: r.extractionOpen ? 'open' : r.convoyGone ? 'gone' : 'not yet',
+        radio: { pending: game.radio.pending, heard: [...game.radio.heard] },
+        slept: r.slept,
+        stats: r.stats,
+      };
+    },
+
+    /**
+     * What is left on the map, and what it is worth. `richness` is searches
+     * remaining; `supply` is the expected supply value of rolling everything
+     * that is left at today's luck.
+     */
+    async economy() {
+      const { expectedSupply } = await import('../systems/Items.js');
+      const CFG = (await import('../core/Config.js')).default;
+      const day = game.run.day;
+      const luck = CFG.loot.luckPerDay[Math.min(day, CFG.loot.luckPerDay.length) - 1];
+      const cont = game.world.interactables.filter((i) => i.type === 'container');
+      let left = 0;
+      let supply = 0;
+      for (const it of cont) {
+        left += it.richness;
+        supply += expectedSupply(it.table, it.thin ? luck * CFG.economy.restockLuck : luck) * it.richness;
+      }
+      return {
+        day,
+        luck,
+        containers: cont.length,
+        emptied: cont.filter((i) => i.richness <= 0).length,
+        searchesLeft: left,
+        expectedSupplies: +supply.toFixed(1),
+        dayCost: +(
+          (CFG.survival.thirstPerHour * 24) / 42 + (CFG.survival.hungerPerHour * 24) / 46
+        ).toFixed(2),
+        claimed: CFG.economy.expectedPerDay.find((r) => r.day === day) || null,
+      };
+    },
+
+    /** What you have built, and how much of it is left. */
+    base() {
+      const b = game.base;
+      return {
+        devices: b.devices.map((d) => ({ kind: d.kind, uses: d.uses, at: [+d.x.toFixed(1), +d.z.toFixed(1)] })),
+        generator: b.generator ? { running: b.generator.running, fuel: Math.round(b.generator.fuel) } : null,
+        stashes: [...b.stashes.values()].map((s) => ({
+          id: s.shelterId,
+          weight: +s.weight.toFixed(1),
+          slots: s.slots.map((x) => `${x.id}:${x.count}`),
+        })),
+        openings: game.world.shelters.map((sh) => ({
+          id: sh.id,
+          state: sh.openings.map((o) => `${o.isDoor ? 'D' : 'W'}:${o.state}${o.tier >= 0 ? '/' + o.tier : ''}`),
+        })),
+      };
+    },
+
     /** Director state, for watching the pacing curve from the console. */
     director() {
       const h = game.horde;
@@ -242,6 +325,9 @@ export function installHarness(game) {
         alive: h.zombies.length,
         waveLeft: h.waveLeft,
         migration: h.migration.state,
+        siege: h.siegeEvent.state,
+        huntsLeft: h.hunt.left,
+        grace: game.run.inGrace,
         lod: h.zombies.filter((z) => z._lodSkip).length,
         navQueue: game.world.nav.queue.length,
         navDropped: game.world.nav.dropped,

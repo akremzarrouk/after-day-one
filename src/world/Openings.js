@@ -63,6 +63,14 @@ export class Opening {
     this.maxHp = this.type === OpeningType.DOOR ? CFG.openings.doorHp : CFG.openings.windowHp;
     this.hp = this.maxHp;
     this.boardHp = 0;
+    /**
+     * Which fortification tier is on it, as an index into `CFG.base.fortify`,
+     * or -1 for nothing. The barricade layer's HP comes from the tier rather
+     * than from a single global multiplier, which is what lets planks, a
+     * reinforced frame and a bolted metal sheet all be the same code path with
+     * three very different answers to "how long does this hold".
+     */
+    this.tier = -1;
     this.boardMax = this.maxHp * CFG.openings.boardHpMul;
 
     this.swing = 0;                   // 0 closed → 1 fully open
@@ -84,7 +92,11 @@ export class Opening {
     this.initialState = this.state;
     this._buildMeshes(spec);
     this._applyState(true);
-    if (this.state === OpeningState.BOARDED) this.boardHp = this.boardMax;
+    if (this.state === OpeningState.BOARDED) {
+      this.tier = 0;
+      this.boardMax = this.maxHp * CFG.base.fortify[0].hpMul;
+      this.boardHp = this.boardMax;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────── build ──
@@ -196,6 +208,7 @@ export class Opening {
     }
     this.group.add(g);
     this.boardGroup = g;
+    this._styleBoards();
   }
 
   // ─────────────────────────────────────────────────────────────── state ──
@@ -220,6 +233,22 @@ export class Opening {
   /** Can a zombie climb it, slowly and obviously? */
   get climbable() {
     return !this.isDoor && this.state === OpeningState.BROKEN;
+  }
+
+  /**
+   * Can the *player* get through this, given a moment and no materials?
+   *
+   * Broader than `passable`, and deliberately so: a shut door is not something
+   * a body walks through, but it is something a person opens, and the
+   * difference decides whether a building you boarded up is a shelter or a
+   * coffin. Every shelter must have at least one of these at all times — the
+   * metagame suite asserts it, because the safehouse ships with four boarded
+   * windows and an objective that tells you to board the fifth opening.
+   */
+  get playerPassable() {
+    if (this.state === OpeningState.BOARDED) return false;
+    if (this.isDoor) return true;               // open, shut or off its hinges
+    return this.vaultable;                      // glass in, or smashed out
   }
 
   get blocksSight() {
@@ -317,15 +346,104 @@ export class Opening {
     return true;
   }
 
-  board() {
-    if (this.state === OpeningState.BOARDED) return false;
+  /**
+   * Put a barricade across it, at tier `level` (an index into
+   * `CFG.base.fortify`).
+   *
+   * Upgrading is not repairing: going from planks to reinforced replaces the
+   * layer outright and gives you the new tier's full HP, because the old
+   * planks are what the new frame is nailed to. Re-applying the *same* tier is
+   * how you patch one back up after a night, and costs the same materials
+   * again — the wood does not come back off the door in one piece.
+   *
+   * @returns true if anything changed.
+   */
+  fortify(level = 0) {
+    const tiers = CFG.base.fortify;
+    const lv = Math.max(0, Math.min(tiers.length - 1, level));
     if (this.state === OpeningState.BROKEN) return false;
-    // Boarding a door shuts it first.
+    if (this.tier > lv) return false;                 // never downgrade
+    if (this.tier === lv && this.boardHp >= this.boardMax - 0.5) return false;
+
+    this.tier = lv;
+    this.boardMax = this.maxHp * tiers[lv].hpMul;
+    this.boardHp = this.boardMax;
     this.setState(OpeningState.BOARDED);
     this.swing = 0;
-    this.boardHp = this.boardMax;
     if (this.hp <= 0) this.hp = this.maxHp * 0.35;   // patched back together
+    if (this.boardGroup) this._styleBoards();
     return true;
+  }
+
+  /** The original one-tier call. Planks, and nothing else. */
+  board() {
+    return this.fortify(0);
+  }
+
+  /**
+   * Take the barricade back off.
+   *
+   * This exists because the alternative is a softlock. The safehouse ships
+   * with four boarded windows, the day-one objective tells you to board the
+   * front door, and the moment you do there is no longer a way out of the
+   * building — which did not matter when dawn was a win screen and matters
+   * enormously now that dawn is a Tuesday.
+   *
+   * Coming off is faster than going on and much louder, and you get the
+   * materials back, so the decision it creates is "can I afford the noise
+   * right now" rather than "can I afford the wood".
+   *
+   * @returns the item id to hand back, or null if there was nothing on it.
+   */
+  unboard() {
+    if (this.state !== OpeningState.BOARDED) return null;
+    const tier = this.tier >= 0 ? CFG.base.fortify[this.tier] : CFG.base.fortify[0];
+    this.boardHp = 0;
+    this.tier = -1;
+    this.boardMax = this.maxHp * CFG.base.fortify[0].hpMul;
+    // A window that was boarded over a hole is a hole again; a boarded door
+    // is a shut door, because the door itself was never the thing you removed.
+    this.setState(this.isDoor ? OpeningState.CLOSED : this.hp > 0 ? OpeningState.CLOSED : OpeningState.BROKEN);
+    return tier.refund || Object.keys(tier.cost)[0];
+  }
+
+  /**
+   * Put a hole back in a wall.
+   *
+   * A broken door or a smashed window cannot be boarded — there is nothing
+   * left to nail to — so making a shelter secure again after a bad night means
+   * rebuilding the frame first, at a heavier price in wood. This is the entire
+   * reason the store is a harder place to hold: it starts with three of them.
+   */
+  repair() {
+    if (this.state !== OpeningState.BROKEN) return false;
+    this.hp = this.maxHp;
+    this.boardHp = 0;
+    this.tier = -1;
+    this.setState(OpeningState.CLOSED);
+    if (this.leafMesh) {
+      this.leafMesh.rotation[this.axis === 'x' ? 'z' : 'x'] = 0;
+      this.leafMesh.position.y = (this.y1 - this.y0 - 0.04) / 2;
+    }
+    return true;
+  }
+
+  /** Boards read as what they are: wood, a frame, or a sheet of steel. */
+  _styleBoards() {
+    if (!this.boardGroup) return;
+    const M = this.world.M;
+    const mat = this.tier >= 2 ? M.metal || M.metalDark : this.tier === 1 ? M.woodDark : M.plank;
+    for (const c of this.boardGroup.children) {
+      c.material = mat;
+      c.visible = true;
+      // A metal sheet is one panel, not five planks: flatten the tilt out.
+      if (this.tier >= 2) c.rotation[this.axis === 'x' ? 'z' : 'x'] = 0;
+    }
+  }
+
+  /** What is nailed across it right now, for the HUD and the prompts. */
+  get tierName() {
+    return this.tier < 0 ? null : CFG.base.fortify[this.tier].name;
   }
 
   /**
@@ -340,6 +458,7 @@ export class Opening {
       this.boardHp -= n;
       if (this.boardHp <= 0) {
         this.boardHp = 0;
+        this.tier = -1;
         this.setState(this.isDoor ? OpeningState.CLOSED : OpeningState.BROKEN);
         return 'boards';
       }
@@ -367,10 +486,43 @@ export class Opening {
   reset(state) {
     this.hp = this.maxHp;
     this.boardHp = 0;
+    this.tier = state === OpeningState.BOARDED ? 0 : -1;
+    this.boardMax = this.maxHp * CFG.base.fortify[0].hpMul;
+    if (state === OpeningState.BOARDED) this.boardHp = this.boardMax;
     this.swing = state === OpeningState.OPEN ? 1 : 0;
     this.swingRate = 1 / CFG.openings.swingTime;
     this.state = state;
     this._applyState(true);
+    this.world.markOpeningDirty(this);
+  }
+
+  // ──────────────────────────────────────────────────────── persistence ──
+
+  /**
+   * Everything about this opening that a reload has to reproduce. Deliberately
+   * flat and primitive-only: the save layer should never have to know what an
+   * `Opening` is, only what one looks like written down.
+   */
+  serialize() {
+    return {
+      id: this.id,
+      state: this.state,
+      hp: +this.hp.toFixed(1),
+      boardHp: +this.boardHp.toFixed(1),
+      tier: this.tier,
+    };
+  }
+
+  restore(s) {
+    if (!s) return;
+    this.tier = s.tier ?? -1;
+    this.boardMax = this.maxHp * (this.tier >= 0 ? CFG.base.fortify[this.tier].hpMul : CFG.openings.boardHpMul);
+    this.hp = s.hp ?? this.maxHp;
+    this.boardHp = s.boardHp ?? 0;
+    this.swing = s.state === OpeningState.OPEN ? 1 : 0;
+    this.state = s.state || OpeningState.CLOSED;
+    this._applyState(true);
+    if (this.boardGroup) this._styleBoards();
     this.world.markOpeningDirty(this);
   }
 

@@ -135,16 +135,35 @@ export class Survival {
     // ── thirst / hunger ──
     const prevThirst = this.thirst;
     const prevHunger = this.hunger;
+
+    /**
+     * Sleeping is cheaper than being awake, and it is not free.
+     *
+     * A night asleep is nine or ten in-game hours: at the waking rate that is
+     * most of a bottle of water and a tin of something, which would make
+     * "board the door and sleep" the answer to everything. At the sleeping
+     * rate it is about half of that, and you still have to have eaten before
+     * you lie down — which is what keeps a secure shelter from being a
+     * solution to the food problem as well as the zombie problem.
+     */
+    const thirstRate = activity.resting ? CFG.run.sleepThirstPerHour : CFG.survival.thirstPerHour;
+    const hungerRate = activity.resting ? CFG.run.sleepHungerPerHour : CFG.survival.hungerPerHour;
+
     this.thirst = clamp(
-      this.thirst - CFG.survival.thirstPerHour * hoursDt - (activity.sprinting ? CFG.survival.thirstSprintExtra * dt : 0),
+      this.thirst - thirstRate * hoursDt - (activity.sprinting ? CFG.survival.thirstSprintExtra * dt : 0),
       0,
       100
     );
     this.hunger = clamp(
-      this.hunger - CFG.survival.hungerPerHour * hoursDt - (activity.sprinting ? CFG.survival.hungerSprintExtra * dt : 0),
+      this.hunger - hungerRate * hoursDt - (activity.sprinting ? CFG.survival.hungerSprintExtra * dt : 0),
       0,
       100
     );
+
+    // …and if there is anything in you to mend with, you mend.
+    if (activity.resting && this.thirst > 12 && this.hunger > 12) {
+      this.heal(CFG.run.sleepHealPerHour * hoursDt);
+    }
 
     const low = CFG.survival.lowThreshold;
     if (prevThirst >= low && this.thirst < low) this.emit('warn', 'Your throat is dry. Find water.');

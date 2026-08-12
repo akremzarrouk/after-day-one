@@ -42,8 +42,21 @@ export class World {
     this.flickerLights = [];
     this.emergencyLights = [];
     this.safehouse = null;
+    /**
+     * Places you can make yours. Two of them, and the choice between them is
+     * the first real base-building decision in the run: the blue house is
+     * four openings and a long walk to anything worth having, the store is
+     * six — two of them already smashed — and it is standing on the best loot
+     * on the map.
+     */
+    this.shelters = [];
+    this.generator = null;
+    this.floodLights = [];
+    this.radioSpot = null;
+    this.convoyLights = [];
     this.playerSpawn = new THREE.Vector3(2.5, 0, 54);
     this.notesRead = new Set();
+    this.blackout = 0;          // 0..1, driven by Run on the night the grid dies
 
     /**
      * Rooms have roofs, so no sunlight gets in and every interior reads as a
@@ -162,7 +175,28 @@ export class World {
         dz = pl.position.z - z;
       if (dx * dx + dz * dz < R * R) return false;
     }
+    // Your own floodlights are the worst of the lot: they are pointed at the
+    // ground you would otherwise be crouching on.
+    for (const fl of this.floodLights) {
+      if (fl.intensity < 1) continue;
+      const dx = fl.position.x - x,
+        dz = fl.position.z - z;
+      if (dx * dx + dz * dz < CFG.base.generator.lightRange * CFG.base.generator.lightRange) return false;
+    }
     return true;
+  }
+
+  /** Which shelter, if any, a point is inside. */
+  shelterAt(x, z) {
+    for (const s of this.shelters) {
+      const b = s.bounds;
+      if (x > b.minX && x < b.maxX && z > b.minZ && z < b.maxZ) return s;
+    }
+    return null;
+  }
+
+  shelterById(id) {
+    return this.shelters.find((s) => s.id === id) || null;
   }
 
   // ───────────────────────────────────────────────────────────── ground ──
@@ -291,7 +325,7 @@ export class World {
     this.root.add(lampMesh);
     b.interiorLight = lantern;
     b.interiorMesh = lampMesh;
-    this.flickerLights.push({ light: lantern, mesh: lampMesh, base: 16, speed: 2.1, amount: 0.1 });
+    this.flickerLights.push({ light: lantern, mesh: lampMesh, base: 16, speed: 2.1, amount: 0.1, battery: true });
 
     // Spray-painted marking outside — someone cleared this house already.
     B.sign(X + 5.06, 1.9, Z + 2.6, 'CLEARED\n4 IN', 2.2, 1.3, Math.PI / 2, {
@@ -325,6 +359,40 @@ export class World {
       },
     };
 
+    /**
+     * The radio. It sits on the shelf against the west wall, on its own, and
+     * it is the entire campaign: one fragment a dawn, hissing to itself until
+     * somebody walks over and listens to it. Nothing else in the house tells
+     * you there is a road out.
+     */
+    const radioMesh = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.2, 0.16), this.M.plasticWhite);
+    radioMesh.position.set(X - 4.1, 1.25, Z + 2.0);
+    radioMesh.rotation.y = Math.PI / 2;
+    radioMesh.castShadow = true;
+    this.root.add(radioMesh);
+    const dial = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.03, 8), this.M.metalDark);
+    dial.rotation.z = Math.PI / 2;
+    dial.position.set(X - 4.02, 1.25, Z + 2.09);
+    this.root.add(dial);
+    this.radioSpot = { x: X - 4.1, z: Z + 2.0, mesh: radioMesh };
+    this.interactables.push({
+      type: 'radio',
+      x: X - 4.1,
+      z: Z + 2.0,
+      y: 1.25,
+      radius: 1.8,
+      label: 'Radio',
+      verb: 'Listen',
+      used: false,
+      id: this.interactables.length,
+    });
+
+    // The stash: the crate by the sofa. Room for everything you cannot carry.
+    this.addStash(X + 3.2, Z + 0.2, 'safehouse', 'Supply crate');
+
+    // ── The generator, out on the concrete beside the porch ──
+    this._generator(X + 8.0, Z - 1.0);
+
     // Containers
     this.addContainer(X + 3.6, Z - 2.8, 'Cabinet', 'kitchen', 1.0);
     this.addContainer(X - 3.0, Z - 2.4, 'Bedside', 'bedroom', 0.9);
@@ -348,7 +416,75 @@ export class World {
       radius: 1.9,
       label: 'Rest until dawn',
       verb: 'Rest',
+      shelterId: 'safehouse',
       used: false,
+    });
+
+    this.shelters.push({
+      id: 'safehouse',
+      name: 'The blue house',
+      bounds: { minX: X - 5, maxX: X + 5, minZ: Z - 4.25, maxZ: Z + 4.25 },
+      centre: { x: X, z: Z },
+      openings: b.openings,
+      hasGenerator: true,
+      hasRadio: true,
+    });
+  }
+
+  /**
+   * The generator and the two floodlights it feeds.
+   *
+   * Everything about it is a trade you make out loud: it stands on the
+   * concrete where you can hear it from inside, it lights the entire approach
+   * so nothing crosses the yard unseen, and for every second it runs there is
+   * a twenty-six metre noise event telling the neighbourhood which house on
+   * this street has a working engine in the garden.
+   */
+  _generator(x, z) {
+    const B = this.B;
+    const G = CFG.base.generator;
+
+    B.box(x, 0, z, 0.9, 0.62, 0.6, this.M.metalDark, { tag: 'generator' });
+    B.deco(x, 0.72, z, 0.24, 0.2, 0.24, this.M.rust, { cast: true });
+    B.deco(x + 0.5, 0.34, z, 0.12, 0.12, 0.5, this.M.metal, { cast: true });
+
+    const lights = [];
+    for (const dz of [-4.5, 4.5]) {
+      B.box(x + 1.6, 0, z + dz, 0.22, 4.2, 0.22, this.M.metalDark);
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.34, 0.3), this.M.metal);
+      head.position.set(x + 1.6, 4.3, z + dz);
+      this.root.add(head);
+
+      /**
+       * Built, but deliberately *not* in the scene until somebody pulls the
+       * cord. three.js bakes the light count into every material's shader, so
+       * four permanently dark spotlights would tax every fragment on the map
+       * for the whole run and make the next recompile — the one the fire
+       * lights trigger — fifteen times more expensive. `Generator` adds them
+       * when it starts and takes them out when it stops.
+       */
+      const spot = new THREE.SpotLight(0xfff0d2, 0, G.lightRange, 0.85, 0.42, 1.1);
+      spot.position.set(x + 1.6, 4.3, z + dz);
+      spot.target.position.set(x + 12, 0, z + dz * 1.6);
+      this.root.add(spot.target);
+      lights.push(spot);
+      // A live floodlight ruins darkness the same way a streetlamp does — but
+      // it is driven by the generator, not by the clock, so it is kept out of
+      // the street-lamp list and given its own.
+      this.floodLights.push(spot);
+    }
+
+    this.generator = { x, z, lights, mesh: null, parent: this.root };
+    this.interactables.push({
+      type: 'generator',
+      x,
+      z,
+      y: 0.8,
+      radius: 2.1,
+      label: 'Generator',
+      verb: 'Use',
+      used: false,
+      id: this.interactables.length,
     });
   }
 
@@ -548,11 +684,25 @@ export class World {
       wallMat: this.M.brickA,
       floorMat: this.M.tile,
       roofStyle: 'flat',
-      doors: [{ side: 'w', offset: 2.0, width: 2.6 }],
+      /**
+       * Six ways in, against the blue house's five — and two of them are
+       * already holes. The storefront window is four metres of nothing, the
+       * south window went the same way, and the loading door at the back is
+       * standing open because that is how everybody got the stock out.
+       *
+       * That is the whole argument for claiming it: it costs six planks and
+       * two rebuilt frames before you can sleep in it, and it is standing on
+       * the best loot on the map.
+       */
+      doors: [
+        { side: 'w', offset: 2.0, width: 2.6 },
+        { side: 'e', offset: -3.0, width: 2.6, open: true },
+      ],
       windows: [
         { side: 'w', offset: -3.0, width: 4.2, broken: true },
         { side: 's', offset: -3.0, width: 3.0, broken: true },
         { side: 's', offset: 3.0, width: 3.0 },
+        { side: 'n', offset: -4.0, width: 2.4 },
       ],
     });
     b.name = 'store';
@@ -595,11 +745,46 @@ export class World {
 
     this.addContainer(X - 2.5, Z - 3.5, 'Shelving', 'store_shelf', 1.2);
     this.addContainer(X - 2.5, Z + 0.5, 'Shelving', 'store_shelf', 1.2);
-    this.addContainer(X + 7.0, Z - 2.0, 'Drinks cooler', 'store_cooler', 1.6);
+    this.addContainer(X + 7.0, Z - 2.0, 'Drinks cooler', 'store_cooler', 1.6, null, CFG.economy.richContainers);
     this.addContainer(X + 7.0, Z + 3.5, 'Drinks cooler', 'store_cooler', 1.4);
     this.addContainer(X - 6.0, Z + 4.2, 'Till', 'register', 1.2);
-    this.addContainer(X + 6.6, Z - 5.0, 'Stockroom shelf', 'store_shelf', 1.8);
+    this.addContainer(X + 6.6, Z - 5.0, 'Stockroom shelf', 'store_shelf', 1.8, null, CFG.economy.richContainers);
     this.addContainer(X + 4.2, Z - 4.6, 'Crate', 'garage', 1.4);
+
+    /**
+     * The other place you can hold.
+     *
+     * A mattress somebody already dragged into the stockroom, and a crate to
+     * put things in. The store is the harder claim by construction — six
+     * openings against the house's four, two of them already smashed out, and
+     * a four-metre storefront window that needs two loads of wood before it is
+     * even a wall — and it is worth it because you are sleeping on top of the
+     * best loot on the map.
+     */
+    B.bed(X + 2.6, Z - 4.4, Math.PI / 2);
+    this.addStash(X + 4.8, Z - 2.4, 'store', 'Stockroom crate');
+    B.crate(X + 4.8, Z - 2.4, 0.15, 0.9);
+    this.interactables.push({
+      type: 'rest',
+      x: X + 2.6,
+      z: Z - 4.4,
+      y: 0.8,
+      radius: 1.8,
+      label: 'Rest until dawn',
+      verb: 'Rest',
+      shelterId: 'store',
+      used: false,
+    });
+
+    this.shelters.push({
+      id: 'store',
+      name: "Marv's",
+      bounds: { minX: X - 8, maxX: X + 8, minZ: Z - 6, maxZ: Z + 6 },
+      centre: { x: X, z: Z },
+      openings: b.openings,
+      hasGenerator: false,
+      hasRadio: false,
+    });
 
     this.addNote(
       X - 6.0, Z + 4.2,
@@ -698,7 +883,7 @@ export class World {
     const barrelLight = new THREE.PointLight(0xff8a3a, 0, 13, 1.7);
     barrelLight.position.set(20.5, 1.4, 5.0);
     this.root.add(barrelLight);
-    this.flickerLights.push({ light: barrelLight, mesh: null, base: 17, speed: 7, amount: 0.42, always: true });
+    this.flickerLights.push({ light: barrelLight, mesh: null, base: 17, speed: 7, amount: 0.42, always: true, battery: true });
   }
 
   // ─────────────────────────────────────────────────────────────── park ──
@@ -783,7 +968,7 @@ export class World {
     const fireLight = new THREE.PointLight(0xff7a28, 0, 15, 1.7);
     fireLight.position.set(cx, 1.5, cz + 0.8);
     this.root.add(fireLight);
-    this.flickerLights.push({ light: fireLight, mesh: null, base: 21, speed: 8.5, amount: 0.5, always: true });
+    this.flickerLights.push({ light: fireLight, mesh: null, base: 21, speed: 8.5, amount: 0.5, always: true, battery: true });
 
     // Low park fence along the road side
     B.fence(-20, -20, -20, -58, 1.2, 'chain');
@@ -811,13 +996,32 @@ export class World {
 
     this.addContainer(-4.5, Z - 5.0, 'Cruiser boot', 'police', 1.8);
     this.addContainer(5.0, Z - 7.5, 'Cruiser boot', 'police', 1.6);
-    this.addContainer(-9.0, Z - 12.0, 'Ambulance', 'medical', 2.0);
+    this.addContainer(-9.0, Z - 12.0, 'Ambulance', 'medical', 2.0, null, CFG.economy.richContainers);
 
     // Triage tent
     B.tent(9.0, Z - 3.0, -0.5, this.M.tarp);
     B.tent(12.0, Z - 5.5, -0.5, this.M.tarp);
-    this.addContainer(9.0, Z - 3.0, 'Medical tent', 'medical', 1.8);
+    this.addContainer(9.0, Z - 3.0, 'Medical tent', 'medical', 1.8, null, CFG.economy.richContainers);
     this.addContainer(12.0, Z - 5.5, 'Medical tent', 'medical', 1.6);
+
+    /**
+     * The road out.
+     *
+     * Nothing is here for four days — the checkpoint is just the place the
+     * story of this street ends. On the fifth morning two sets of headlights
+     * come on beyond the sandbags and idle for three hours, and that is the
+     * entire extraction marker: no waypoint, no arrow, a light on the horizon
+     * you can see from the crossroads if you are looking north.
+     */
+    for (const dx of [-2.6, 2.6]) {
+      const head = new THREE.SpotLight(0xfff4e0, 0, 70, 0.5, 0.35, 1.0);
+      head.position.set(CFG.run.extractPoint.x + dx, 1.4, CFG.run.extractPoint.z - 3.5);
+      head.target.position.set(CFG.run.extractPoint.x + dx * 2, 0, CFG.run.extractPoint.z + 34);
+      this.root.add(head.target);
+      // Same rule as the floodlights: out of the scene until the morning they
+      // are needed, so four days of play do not pay for them.
+      this.convoyLights.push(head);
+    }
 
     for (const [bx, bz, r] of [
       [8.0, Z + 1.5, 0.2],
@@ -1066,8 +1270,12 @@ export class World {
    * @param guaranteed  item id (or [id, count]) this container always yields
    *                    on top of its table roll. Used sparingly, to make sure
    *                    the opening ten minutes can't be ruined by dice.
+   * @param richness    how many searches are in it. Most things hold exactly
+   *                    one; the places worth the walk hold two. An emptied
+   *                    container stays empty unless a dawn puts a thin roll
+   *                    back in it — see `Run.restock`.
    */
-  addContainer(x, z, label, table, radius = 1.2, guaranteed = null) {
+  addContainer(x, z, label, table, radius = 1.2, guaranteed = null, richness = CFG.economy.dayOneRichness) {
     const it = {
       type: 'container',
       x,
@@ -1079,6 +1287,36 @@ export class World {
       guaranteed,
       verb: 'Search',
       searchTime: CFG.loot.searchTimeBase * (0.85 + Math.random() * 0.5),
+      richness,
+      baseRichness: richness,
+      thin: false,
+      // Has this ever been searched? Distinct from `used`, which only says it
+      // is empty *now* — a restocked container is not empty and must still
+      // never hand out its guaranteed item a second time.
+      looted: false,
+      used: false,
+      id: this.interactables.length,
+    };
+    this.interactables.push(it);
+    return it;
+  }
+
+  /**
+   * A box in the corner of a room you can decide is yours.
+   *
+   * Purely a marker — the `Stash` that goes with it lives in `Base`, keyed by
+   * the shelter's id, so the geometry never has to know what is in it.
+   */
+  addStash(x, z, shelterId, label = 'Stash') {
+    const it = {
+      type: 'stash',
+      x,
+      z,
+      y: 1.0,
+      radius: 1.9,
+      label,
+      verb: 'Open',
+      shelterId,
       used: false,
       id: this.interactables.length,
     };
@@ -1279,6 +1517,17 @@ export class World {
     }
   }
 
+  /** Refill the map. Called when a run restarts, and nowhere else. */
+  resetContainers() {
+    for (const it of this.interactables) {
+      if (it.type !== 'container') continue;
+      it.richness = it.baseRichness ?? CFG.economy.dayOneRichness;
+      it.thin = false;
+      it.looted = false;
+      it.used = false;
+    }
+  }
+
   /** Put every door and window back the way it was authored. */
   resetOpenings() {
     for (const op of this.openings) op.reset(op.initialState);
@@ -1335,11 +1584,17 @@ export class World {
     this.interiorFill.intensity += (fillTarget - this.interiorFill.intensity) * Math.min(1, dt * 4);
     this.interiorAmbient.intensity += (ambTarget - this.interiorAmbient.intensity) * Math.min(1, dt * 4);
 
-    // Streetlamp glow
-    const lampOn = night ? 1 : 0;
+    /**
+     * Streetlamp glow — and, on the night the grid dies, the absence of it.
+     * `blackout` is a 0..1 ramp owned by `Run`; everything the grid feeds
+     * simply multiplies by what is left of it, so the street goes out as one
+     * continuous thing rather than as a switch.
+     */
+    const grid = 1 - this.blackout;
+    const lampOn = night ? grid : 0;
     for (const sl of this.streetlights) {
       const bulb = sl.userData.bulb;
-      if (bulb) bulb.material = lampOn ? this.M.emissiveWarm : this.M.plasticWhite;
+      if (bulb) bulb.material = lampOn > 0.35 ? this.M.emissiveWarm : this.M.plasticWhite;
     }
     if (this.lampLights) {
       for (const pl of this.lampLights) {
@@ -1348,9 +1603,22 @@ export class World {
       }
     }
 
+    // Two sets of headlights, three hours, once in a run.
+    const convoyTarget = this.convoyOn ? 90 : 0;
+    for (const cl of this.convoyLights) {
+      if (this.convoyOn && !cl.parent) this.root.add(cl);
+      cl.intensity += (convoyTarget - cl.intensity) * Math.min(1, dt * 1.2);
+      if (!this.convoyOn && cl.parent && cl.intensity < 0.5) {
+        cl.intensity = 0;
+        this.root.remove(cl);
+      }
+    }
+
     // Interior + flickering lights
     for (const f of this.flickerLights) {
-      const on = f.always ? 1 : night ? 1 : 0;
+      // Anything on the mains dies with the grid. A camping lantern and a
+      // barrel full of burning pallets do not care what the grid is doing.
+      const on = (f.always ? 1 : night ? 1 : 0) * (f.battery ? 1 : grid);
       let v = f.base;
       if (f.stutter) {
         const n = Math.sin(this._t * f.speed) * Math.sin(this._t * f.speed * 2.7 + 1.3);

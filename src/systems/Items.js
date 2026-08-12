@@ -155,6 +155,53 @@ export const ITEMS = {
     weight: 3.2,
     desc: 'Enough to board one doorway. Heavy. Worth carrying anyway.',
   },
+  /**
+   * The base-building materials. All four are deliberately dull objects that
+   * only mean something once you have decided which door matters — a box of
+   * nails is worthless until the night you know they are coming through the
+   * kitchen.
+   */
+  nails: {
+    id: 'nails',
+    name: 'Box of Nails',
+    short: 'Nails',
+    type: ItemType.RESOURCE,
+    icon: '📎',
+    stack: 4,
+    weight: 0.7,
+    desc: 'Four inches, galvanised. Six of them through a plank makes a doorway hurt.',
+  },
+  string: {
+    id: 'string',
+    name: 'Ball of String',
+    short: 'String',
+    type: ItemType.RESOURCE,
+    icon: '🧵',
+    stack: 4,
+    weight: 0.2,
+    desc: 'Garden twine. Hang cans off it across a gap and you get ten seconds of warning.',
+  },
+  metal_sheet: {
+    id: 'metal_sheet',
+    name: 'Metal Sheet',
+    short: 'Sheet',
+    type: ItemType.RESOURCE,
+    icon: '🛡',
+    stack: 2,
+    weight: 6.5,
+    desc: 'Corrugated steel off somebody’s shed. Heavy enough that you will only carry one.',
+  },
+  fuel: {
+    id: 'fuel',
+    name: 'Jerry Can',
+    short: 'Fuel',
+    type: ItemType.RESOURCE,
+    icon: '⛽',
+    stack: 2,
+    weight: 4.4,
+    desc: 'Four minutes of generator, or one very stupid idea. Sloshes when you run.',
+  },
+
   ammo_38: {
     id: 'ammo_38',
     name: '.38 Rounds',
@@ -574,11 +621,15 @@ export const LOOT_TABLES = {
     { w: 13, id: 'planks' },
     { w: 11, id: 'crowbar' },
     { w: 9, id: 'tools' },
+    { w: 9, id: 'nails' },
     { w: 8, id: 'battery', n: [1, 2] },
+    { w: 7, id: 'fuel' },
     { w: 6, id: 'fire_axe' },
     { w: 6, id: 'flashlight' },
+    { w: 6, id: 'string' },
     { w: 5, id: 'sledgehammer' },
     { w: 5, id: 'machete' },
+    { w: 4, id: 'metal_sheet' },
     { w: 4, id: 'molotov', n: [1, 2] },
   ],
   store_shelf: [
@@ -588,7 +639,9 @@ export const LOOT_TABLES = {
     { w: 16, id: 'canned_food', n: [1, 3] },
     { w: 14, id: 'energy_bar', n: [1, 3] },
     { w: 10, id: 'soda', n: [1, 2] },
+    { w: 8, id: 'string' },
     { w: 6, id: 'battery', n: [1, 2] },
+    { w: 5, id: 'nails' },
   ],
   store_cooler: [
     { w: 22, id: 'glass_bottle', n: [1, 3] },
@@ -611,7 +664,9 @@ export const LOOT_TABLES = {
     { w: 10, id: 'planks' },
     { w: 8, id: 'crowbar' },
     { w: 8, id: 'battery' },
+    { w: 7, id: 'fuel' },
     { w: 6, id: 'tools' },
+    { w: 6, id: 'nails' },
     { w: 5, id: 'energy_bar', n: [1, 2] },
     { w: 4, id: 'molotov' },
   ],
@@ -650,12 +705,39 @@ export const LOOT_TABLES = {
     { w: 15, id: 'water_bottle', n: [1, 2] },
     { w: 10, id: 'painkillers' },
     { w: 8, id: 'planks' },
+    { w: 8, id: 'string' },
     { w: 7, id: 'molotov', n: [1, 2] },
     { w: 6, id: 'energy_bar' },
+    { w: 6, id: 'fuel' },
     { w: 5, id: 'machete' },
     { w: 4, id: 'tools' },
   ],
 };
+
+/**
+ * What one roll of a table is *worth*, in supplies, on average.
+ *
+ * The economy is balanced against a number the tables imply rather than a
+ * number written down beside them, so this computes it from the tables
+ * themselves — change a weight and the expectation moves with it. Used by
+ * `CFG.economy.expectedPerDay` and asserted by the metagame self-test.
+ */
+export function expectedSupply(tableId, luck = 1) {
+  const table = LOOT_TABLES[tableId];
+  if (!table) return 0;
+  let total = 0;
+  let sum = 0;
+  for (const e of table) {
+    const w = e.id === null ? e.w / luck : e.w * luck;
+    sum += w;
+    if (!e.id) continue;
+    const supply = ITEMS[e.id]?.supply || 0;
+    if (!supply) continue;
+    const n = e.n ? (e.n[0] + e.n[1]) / 2 : 1;
+    total += w * supply * n;
+  }
+  return sum > 0 ? total / sum : 0;
+}
 
 /** Roll a table into a list of {id, count}. */
 export function rollLoot(tableId, rng, luck = 1) {

@@ -761,14 +761,35 @@ class Harness {
     }
     const nightSpecials = ['screamer', 'runner', 'brute'].filter((k) => (nightRolled[k] || 0) > 0);
 
+    /**
+     * The campaign layer gates them a second time, and harder: night one's
+     * curve puts every special weight at zero, so the first night of a run
+     * rolls the original three even at three in the morning. Night two turns
+     * them back on. Both facts are data in `CFG.nights`, and both are checked
+     * here so the two gates cannot drift apart.
+     */
+    const withCurve = (night) => {
+      const c = { night: true, hour: 23.0, elapsedHours: 7, pastFirstDusk: true, curve: CFG.nights[night - 1] };
+      const out = {};
+      for (let i = 0; i < 2000; i++) {
+        const t = h._pickType(c);
+        out[t] = (out[t] || 0) + 1;
+      }
+      return ['screamer', 'runner', 'brute'].reduce((n, k) => n + (out[k] || 0), 0);
+    };
+    const nightOneCurve = withCurve(1);
+    const nightTwoCurve = withCurve(2);
+
     this.record(
-      'gating · day one before dusk rolls the original three archetypes and nothing else',
-      specials === 0 && nightSpecials.length === 3,
+      'gating · day one before dusk, and the whole of night one, roll the original three and nothing else',
+      specials === 0 && nightSpecials.length === 3 && nightOneCurve === 0 && nightTwoCurve > 0,
       {
         dayOneRolls: rolled,
         specialsOnDayOne: specials,
         nightRolls: nightRolled,
         specialsAvailableAtNight: nightSpecials,
+        specialsOnNightOne: nightOneCurve,
+        specialsOnNightTwo: nightTwoCurve,
       }
     );
   }

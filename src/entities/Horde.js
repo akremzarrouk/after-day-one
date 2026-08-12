@@ -63,6 +63,20 @@ export class Horde {
     this._siegeQueues = new Map();
 
     /**
+     * The metagame's two directed events.
+     *
+     * `hunt` is the anti-AFK guarantee: from night two, parties form at the
+     * edge of the map already knowing where your shelter is, so a player who
+     * boards the door and does nothing gets found anyway. `siegeEvent` is the
+     * night-three novelty — the migration, but aimed, and it does not turn
+     * aside.
+     */
+    this.hunt = { night: -1, left: 0, timer: 0, tele: 0, groan: 0 };
+    this.siegeEvent = { state: 'idle', t: 0, night: -1, from: null, to: null, members: [], groan: 0 };
+    this._disperseAcc = 0;
+    this._dispersing = false;
+
+    /**
      * Attack tokens. Without this, six zombies around you all wind up at once
      * and there is no play — just a damage number. Two at a time keeps a group
      * genuinely lethal while leaving room to block, back off or swing.
@@ -101,6 +115,10 @@ export class Horde {
     this.waveLeft = 0;
     this.events.length = 0;
     this.migration = { state: 'idle', t: 0, from: null, to: null, night: -1, members: [] };
+    this.hunt = { night: -1, left: 0, timer: 0, tele: 0, groan: 0 };
+    this.siegeEvent = { state: 'idle', t: 0, night: -1, from: null, to: null, members: [], groan: 0 };
+    this._disperseAcc = 0;
+    this._dispersing = false;
     this._siegeQueues.clear();
   }
 
@@ -321,8 +339,43 @@ export class Horde {
 
     this._separateFromPlayer(dt, ctx.player);
     this._updateSieges(dt, ctx);
-    this._director(dt, ctx);
-    this._updateMigration(dt, ctx);
+
+    /**
+     * The director runs on *game* time, not on wall time.
+     *
+     * Bodies move at the speed bodies move at, whatever the clock is doing —
+     * but how many of them there are, when the street crests, and when a
+     * hunting party sets off are all functions of how much of the night has
+     * gone. Without this, sleeping through a night at nine times speed would
+     * get you a ninth of the horde and none of the hunts, and "board the door
+     * and go to bed" would be the answer to the entire game.
+     */
+    const scale = ctx.simScale || 1;
+    const ddt = dt * scale;
+    this._quiet = scale > 2;              // no ambient audio while fast-forwarding
+
+    this._director(ddt, ctx);
+
+    /**
+     * Dawn stops the directed events too, and it has to be said here rather
+     * than left to the `night` flag.
+     *
+     * `night` is a light level, and the light level does not cross its
+     * threshold until about 06:45 — so for the first three quarters of an
+     * hour of a grace window that promises "nothing new arrives", a hunting
+     * party or a siege column could still form up and set off. The grace
+     * phase is the promise; the sun coming up is just weather.
+     */
+    if (ctx.grace) return;
+
+    this._updateMigration(ddt, ctx);
+    this._updateHunt(ddt, ctx);
+    this._updateSiegeEvent(ddt, ctx);
+  }
+
+  /** The night's escalation row, or a flat one when nobody supplied it. */
+  _curve(ctx) {
+    return ctx.curve || { pop: 1, speed: 1, specials: 1, waveBonus: 0, hunt: 0, event: null };
   }
 
   /**
@@ -506,7 +559,8 @@ export class Horde {
     this.phaseTime = 0;
     if (next === Phase.PEAK) {
       const D = CFG.director;
-      this.waveLeft = ctx.night ? D.waveCountNight : D.waveCount;
+      const base = ctx.night ? D.waveCountNight : D.waveCount;
+      this.waveLeft = base + (ctx.night ? this._curve(ctx).waveBonus : 0);
       this.waveTimer = 0;
     }
     if (next === Phase.RELAX) {
@@ -534,6 +588,24 @@ export class Horde {
     const decay = this.phase === Phase.RELAX ? D.pressureDecayRelax : D.pressureDecay;
     this.pressure = Math.max(0, Math.min(1.8, this.pressure + (gain - decay) * dt));
 
+    /**
+     * Dawn.
+     *
+     * The director stops. Not "spawns fewer" — stops: no ambient, no
+     * crescendo, no waves, and the pressure meter bleeds out at the RELAX
+     * rate. Everything still standing is told to go home, and goes. Two
+     * in-game hours of that is what turns five nights into five *days*, each
+     * one of which starts from a street you can walk down.
+     */
+    if (ctx.grace) {
+      this.pressure = Math.max(0, this.pressure - D.pressureDecayRelax * 2 * dt);
+      if (this.phase !== Phase.RELAX) this._setPhase(Phase.RELAX, ctx);
+      this.phaseTime = 0;                       // RELAX never expires in grace
+      this._dawnDisperse(dt, ctx);
+      return;
+    }
+    if (this._dispersing) this._endDisperse();
+
     switch (this.phase) {
       case Phase.BUILD: {
         this._ambient(dt, ctx);
@@ -555,12 +627,96 @@ export class Horde {
         this.relaxAudioTimer -= dt;
         if (this.relaxAudioTimer <= 0) {
           this.relaxAudioTimer = 5 + Math.random() * 7;
-          this.audio.distantSound(ctx.night);
+          if (!this._quiet) this.audio.distantSound(ctx.night);
         }
         const dur = ctx.night ? D.relaxTimeNight : D.relaxTime;
         if (this.phaseTime >= dur) this._setPhase(Phase.BUILD, ctx);
         break;
       }
+    }
+  }
+
+  /**
+   * Dawn dispersal.
+   *
+   * Two things at once, and the split is the whole reason it reads: everything
+   * loses the thread and starts walking toward the edge of the map — which is
+   * the bit you *see*, bodies drifting away up the road — while the ones
+   * already too far off to be worth simulating are quietly removed, farthest
+   * first, at a fixed rate. Nothing ever vanishes in front of you.
+   */
+  _dawnDisperse(dt, ctx) {
+    const R = CFG.run;
+    const E = CFG.world.size / 2 - 6;
+    const hold = ctx.holdNear || null;
+
+    if (!this._dispersing) {
+      this._dispersing = true;
+      this._disperseAcc = 0;
+      this.log('dawn:disperse', this.zombies.length);
+    }
+
+    for (const z of this.zombies) {
+      if (z.isDead || z.dispersing) continue;
+      /**
+       * Day five: whatever is standing between you and the convoy stays
+       * exactly where it is. The dash for the road is the one dawn in the run
+       * that is not a grace period.
+       */
+      if (hold && Math.hypot(z.pos.x - hold.x, z.pos.z - hold.z) <= hold.r) continue;
+
+      z.dispersing = true;
+      z.awareness = 0;
+      z.lastKnown = null;
+      z.knownHide = null;
+      z.siegeTarget = null;
+      z.climbTarget = null;
+      const dx = z.pos.x - ctx.player.pos.x;
+      const dz = z.pos.z - ctx.player.pos.z;
+      const d = Math.hypot(dx, dz) || 1;
+      z.migrateTo = {
+        x: Math.max(-E, Math.min(E, z.pos.x + (dx / d) * 120)),
+        z: Math.max(-E, Math.min(E, z.pos.z + (dz / d) * 120)),
+      };
+      z.state = ZState.WANDER;
+      z.wanderTimer = 999;
+      z._pickWander();
+    }
+
+    this._disperseAcc += R.disperseRate * dt;
+    while (this._disperseAcc >= 1 && this.zombies.length) {
+      let idx = -1;
+      let bd = -1;
+      for (let i = 0; i < this.zombies.length; i++) {
+        const z = this.zombies[i];
+        if (!z.dispersing) continue;
+        const d = Math.hypot(z.pos.x - ctx.player.pos.x, z.pos.z - ctx.player.pos.z);
+        if (d > bd) {
+          bd = d;
+          idx = i;
+        }
+      }
+      // Nothing left that is far enough away to remove unseen: let them walk.
+      if (idx < 0 || bd < R.disperseKeepRadius) break;
+      this._disperseAcc -= 1;
+      const z = this.zombies.splice(idx, 1)[0];
+      z.dispose();
+    }
+  }
+
+  _endDisperse() {
+    this._dispersing = false;
+    for (const z of this.zombies) {
+      if (!z.dispersing) continue;
+      z.dispersing = false;
+      /**
+       * Give them their heads back. `migrateTo` overrides wandering entirely,
+       * so anything that survived the grace window would otherwise spend the
+       * rest of the run walking at the same point on the map edge and
+       * standing on it — the group is `drifter`, not `migration`, so nothing
+       * else was ever going to clear it.
+       */
+      if (z.group !== 'migration') z.migrateTo = null;
     }
   }
 
@@ -573,7 +729,12 @@ export class Horde {
     const night = ctx.night;
     this.spawnTimer = night ? 9 + Math.random() * 8 : 16 + Math.random() * 14;
 
-    const target = night ? D.targetNight : D.targetDay;
+    /**
+     * The night curve's population multiplier. Night one is the target the
+     * game shipped with; night five is 85% more of it, arriving faster and
+     * moving quicker, and none of that is written anywhere but `CFG.nights`.
+     */
+    const target = Math.round((night ? D.targetNight : D.targetDay) * (night ? this._curve(ctx).pop : 1));
     const alive = this.zombies.length;
     if (alive >= target) return;
     const n = Math.min(night ? 3 : 2, target - alive);
@@ -625,17 +786,28 @@ export class Horde {
       { w: 12, id: 'bloated' },
     ];
 
-    if (D.specialsInPhases.includes(this.phase)) {
+    /**
+     * The night curve scales every special's weight, and it governs the day
+     * that leads into that night as well — so day one and night one both sit
+     * at zero and roll exactly the three original archetypes.
+     *
+     * That is not a special case in the code and it is a very deliberate one
+     * in the design: the first night must be beatable by a player who found
+     * nothing, boarded nothing and knows none of this yet.
+     */
+    const specialMul = this._curve(ctx).specials;
+
+    if (specialMul > 0 && D.specialsInPhases.includes(this.phase)) {
       const hour = ctx.hour ?? 12;
       const night = !!ctx.night;
       const afterDusk = !!ctx.pastFirstDusk;
 
-      if (!S.runner.nightOnly || night) opts.push({ w: S.runner.weight, id: 'runner' });
+      if (!S.runner.nightOnly || night) opts.push({ w: S.runner.weight * specialMul, id: 'runner' });
       if (this._afterHour(hour, S.screamer.earliestHour)) {
-        opts.push({ w: S.screamer.weight, id: 'screamer' });
+        opts.push({ w: S.screamer.weight * specialMul, id: 'screamer' });
       }
       if (afterDusk && this.countType('brute') < S.brute.maxAlive) {
-        opts.push({ w: S.brute.weight, id: 'brute' });
+        opts.push({ w: S.brute.weight * specialMul, id: 'brute' });
       }
     }
     return this.rng.weighted(opts).id;
@@ -691,9 +863,11 @@ export class Horde {
       this.groanTimer = (this.groanTimer || 0) - dt;
       if (this.groanTimer <= 0) {
         this.groanTimer = M.groanInterval;
-        const sp = this.audio.spatial(m.from.x, m.from.z, 200);
-        // Louder as they get closer to arriving.
-        this.audio.distantHorde(sp.pan, 0.55 + (m.t / M.telegraph) * 0.9);
+        if (!this._quiet) {
+          const sp = this.audio.spatial(m.from.x, m.from.z, 200);
+          // Louder as they get closer to arriving.
+          this.audio.distantHorde(sp.pan, 0.55 + (m.t / M.telegraph) * 0.9);
+        }
       }
       if (m.t >= M.telegraph) {
         this._spawnMigration(ctx);
@@ -788,6 +962,187 @@ export class Horde {
       made++;
     }
     this.log('migration:arrive', made);
+    return made;
+  }
+
+  // ──────────────────────────────────────────── hunts and aimed sieges ──
+
+  /**
+   * Hunting parties. The promise that passivity is not a strategy.
+   *
+   * From night two, a handful of bodies form up at the edge of the map every
+   * ninety-odd seconds already knowing which building is yours, and walk to
+   * it. They are not summoned by noise and they cannot be waited out — the
+   * only answers are to not be there, to have spent your planks on the right
+   * door, or to fight. A player asleep behind an unboarded window on night
+   * four will be woken by them; that is the entire point.
+   */
+  _updateHunt(dt, ctx) {
+    const H = CFG.hunt;
+    const h = this.hunt;
+    if (!ctx.night || !ctx.shelter) return;
+    const want = this._curve(ctx).hunt;
+    if (!want) return;
+
+    if (h.night !== ctx.runDay) {
+      h.night = ctx.runDay;
+      h.left = want;
+      h.timer = H.firstDelay;
+      h.tele = 0;
+    }
+    if (h.left <= 0) return;
+
+    if (h.tele > 0) {
+      h.tele -= dt;
+      h.groan -= dt;
+      if (h.groan <= 0) {
+        h.groan = 3.0;
+        if (!this._quiet) {
+          const sp = this.audio.spatial(ctx.shelter.centre.x, ctx.shelter.centre.z, 200);
+          this.audio.distantHorde(sp.pan, 0.5);
+        }
+      }
+      if (h.tele <= 0) {
+        const made = this._spawnHunt(ctx);
+        h.left--;
+        h.timer = H.interval;
+        this.log('hunt', made);
+      }
+      return;
+    }
+
+    h.timer -= dt;
+    if (h.timer <= 0) h.tele = H.telegraph;
+  }
+
+  _spawnHunt(ctx) {
+    const H = CFG.hunt;
+    const n = H.minCount + Math.floor(Math.random() * (H.maxCount - H.minCount + 1));
+    const c = ctx.shelter.centre;
+    const R = CFG.world.size / 2 - 8;
+    const a = Math.random() * Math.PI * 2;
+    let made = 0;
+    for (let i = 0; i < n; i++) {
+      const aa = a + (Math.random() - 0.5) * 0.5;
+      const d = R * (0.85 + Math.random() * 0.15);
+      const x = Math.cos(aa) * d;
+      const z = Math.sin(aa) * d;
+      if (this.world.nav.isBlockedWorld(x, z)) continue;
+      const zo = this.spawn(x, z, this._pickType(ctx), 'hunt');
+      if (!zo) continue;
+      // They know the house, not the room. What they do when they get there
+      // is whatever the ordinary siege logic decides.
+      zo.lastKnown = { x: c.x + (Math.random() - 0.5) * 4, z: c.z + (Math.random() - 0.5) * 4 };
+      zo.awareness = 0.72;
+      zo._enterInvestigate();
+      made++;
+    }
+    return made;
+  }
+
+  /**
+   * The night-three novelty: the migration, aimed.
+   *
+   * Everything about it is the migration — a column, a long telegraph, a line
+   * across the map — except the two facts that matter. The line ends at your
+   * front door, and they are not going anywhere afterwards. Twenty-six seconds
+   * of massed groaning from a bearing that does not drift is the game asking
+   * whether the boards you spent this afternoon on were on the right side of
+   * the house.
+   */
+  _updateSiegeEvent(dt, ctx) {
+    const S = CFG.siege;
+    const s = this.siegeEvent;
+    if (s.enabled === false) return;
+    const night = ctx.runDay || 0;
+
+    if (s.state === 'idle') {
+      if (!ctx.night || !ctx.shelter) return;
+      if (night < S.fromNight) return;
+      if (s.night === night) return;
+      if (!this._afterHour(ctx.hour ?? 0, S.earliestHour)) return;
+      s.night = night;
+      s.to = { x: ctx.shelter.centre.x, z: ctx.shelter.centre.z };
+      s.from = this._siegeApproach(s.to);
+      s.t = 0;
+      s.groan = 0;
+      s.state = 'telegraph';
+      this.log('siege:telegraph', s.from);
+      ctx.onSiegeWarning?.(s.from);
+      return;
+    }
+
+    if (s.state === 'telegraph') {
+      s.t += dt;
+      s.groan -= dt;
+      if (s.groan <= 0) {
+        s.groan = CFG.migration.groanInterval;
+        if (!this._quiet) {
+          const sp = this.audio.spatial(s.from.x, s.from.z, 200);
+          this.audio.distantHorde(sp.pan, 0.7 + (s.t / S.telegraph) * 0.9);
+        }
+      }
+      if (s.t >= S.telegraph) {
+        s.state = 'walking';
+        s.t = 0;
+        this.log('siege:arrive', this._spawnSiege(ctx));
+      }
+      return;
+    }
+
+    if (s.state === 'walking') {
+      s.t += dt;
+      for (let i = s.members.length - 1; i >= 0; i--) {
+        const z = s.members[i];
+        if (z.isDead || !this.zombies.includes(z)) s.members.splice(i, 1);
+      }
+      // They do not leave. They are done when they are dead or it is morning.
+      if (!s.members.length || !ctx.night) {
+        s.state = 'idle';
+        s.members.length = 0;
+        this.log('siege:done');
+      }
+    }
+  }
+
+  /** A point on the map edge to come at the shelter from. */
+  _siegeApproach(to) {
+    const R = CFG.world.size / 2 - CFG.migration.spawnMargin;
+    for (let i = 0; i < 20; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const p = { x: Math.cos(a) * R, z: Math.sin(a) * R };
+      if (Math.hypot(p.x - to.x, p.z - to.z) < 40) continue;
+      if (this.world.nav.isBlockedWorld(p.x, p.z)) continue;
+      return p;
+    }
+    return { x: 0, z: -R };
+  }
+
+  _spawnSiege(ctx) {
+    const S = CFG.siege;
+    const s = this.siegeEvent;
+    const n = S.minCount + Math.floor(Math.random() * (S.maxCount - S.minCount + 1));
+    const dx = s.to.x - s.from.x;
+    const dz = s.to.z - s.from.z;
+    const l = Math.hypot(dx, dz) || 1;
+    const px = -dz / l;
+    const pz = dx / l;
+
+    let made = 0;
+    for (let i = 0; i < n; i++) {
+      const lat = (Math.random() * 2 - 1) * S.spread;
+      const back = Math.random() * 8;
+      const x = s.from.x + px * lat - (dx / l) * back;
+      const z = s.from.z + pz * lat - (dz / l) * back;
+      if (Math.abs(x) > CFG.world.size / 2 - 2 || Math.abs(z) > CFG.world.size / 2 - 2) continue;
+      const zo = this.spawn(x, z, this._pickType(ctx), 'siege');
+      if (!zo) continue;
+      zo.lastKnown = { x: s.to.x + (Math.random() - 0.5) * 5, z: s.to.z + (Math.random() - 0.5) * 5 };
+      zo.awareness = 0.9;
+      zo._enterInvestigate();
+      s.members.push(zo);
+      made++;
+    }
     return made;
   }
 

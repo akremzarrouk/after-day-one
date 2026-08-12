@@ -52,13 +52,286 @@ export const CFG = {
 
   time: {
     startHour: 16.4,          // late afternoon — sunset comes soon
-    // Real seconds per in-game hour. Night is deliberately longer to play in.
+    /**
+     * Real seconds per in-game hour, and therefore the length of the whole
+     * campaign. A run is 16:24 on day one to 08:00 on day five — 87.6 in-game
+     * hours — so 46 s/hour puts a full five-day run at about 67 real minutes,
+     * of which each night is 9.8 hours ≈ 7.5 minutes. Both numbers are the
+     * session shape the metagame is designed around; move this and you move
+     * the whole campaign together.
+     */
     secondsPerHour: 46,
     dawnHour: 6.2,
     duskStart: 18.4,
     duskEnd: 20.2,
     dawnStart: 5.0,
     dawnEnd: 7.0,
+  },
+
+  /**
+   * The run.
+   *
+   * Five days, each one a scavenge-and-fortify loop bracketed by a night you
+   * have to live through, ending in a convoy on the highway at first light on
+   * day five. The whole arc is here: what the clock does, what a night costs,
+   * what sleeping requires, and where the road out is.
+   */
+  run: {
+    days: 5,
+
+    // ── the day's shape ──
+    // DAWN is a grace phase: the director sleeps and the night's survivors
+    // wander off. It is the only part of the day that is not trying to kill
+    // you, and it is where every dawn beat (restock, radio, save) happens.
+    dawnStart: 6.0,
+    dawnEnd: 8.0,
+    duskWarn: 18.5,             // "the light is going" — the day's last call
+    nightStart: 20.2,
+
+    // Dawn dispersal. Anything still standing when the sun comes up loses
+    // interest and walks off the map; the far ones simply stop existing,
+    // because nobody is watching them.
+    disperseRate: 2.6,          // bodies removed per second, farthest first
+    disperseKeepRadius: 18,     // inside this they walk away first, visibly
+
+    /**
+     * Sleeping through a night is the strongest move in the game, so it is
+     * gated on the shelter actually being a shelter: every door and window
+     * intact or boarded, and nothing aware of you standing outside.
+     */
+    sleepClearRadius: 20,
+    sleepAwareness: 0.4,        // a body above this awareness inside the radius blocks it
+    sleepTimeScale: 9,          // the night still runs — a siege still wakes you
+    sleepThirstPerHour: 3.1,    // you dry out slower asleep, but you do dry out
+    sleepHungerPerHour: 2.2,
+    sleepHealPerHour: 2.4,      // and you mend a little, if you had the calories
+
+    /**
+     * Extraction. The convoy forms on the highway north of the checkpoint and
+     * leaves at first light on day five. It will not wait, and there is no
+     * marker for it — the radio names the place and you have walked past the
+     * sandbags every day since.
+     */
+    extractDay: 5,
+    extractFrom: 6.0,
+    extractTo: 9.0,
+    extractPoint: { x: 0, z: -60 },
+    extractRadius: 6.5,
+  },
+
+  /**
+   * Per-night escalation curves.
+   *
+   * One row per night, indexed from night 1. Everything the director does at
+   * night is multiplied through here, so the difference between night 1 and
+   * night 5 is data rather than special cases. `event` is the one pressure
+   * novelty that night introduces:
+   *
+   *   null       nothing new — night 1 is the game as it was
+   *   specials   the screamer, the runner and the brute come back
+   *   siege      a column forms up and walks at *your* shelter
+   *   blackout   the grid dies: streetlights off, fog closes in
+   *   everything all of it, and then a run for the road at dawn
+   *
+   * `specials` scales the weight of every special in the ambient roll, so
+   * night 1 at 0 rolls exactly the three original archetypes — which is what
+   * makes a no-fortification night-1 win a matter of skill.
+   */
+  nights: [
+    { pop: 1.00, speed: 1.00, specials: 0.0, waveBonus: 0, hunt: 0, event: null },
+    { pop: 1.18, speed: 1.03, specials: 1.0, waveBonus: 1, hunt: 1, event: 'specials' },
+    { pop: 1.36, speed: 1.07, specials: 1.3, waveBonus: 2, hunt: 2, event: 'siege' },
+    { pop: 1.58, speed: 1.11, specials: 1.6, waveBonus: 3, hunt: 2, event: 'blackout' },
+    { pop: 1.85, speed: 1.16, specials: 2.0, waveBonus: 4, hunt: 3, event: 'everything' },
+  ],
+
+  /**
+   * The anti-AFK guarantee.
+   *
+   * From night two, a passive player is found. Every `huntInterval` seconds a
+   * hunting party forms at the edge of the map already knowing where your
+   * shelter is and walks to it. `hunt` in the night curve is how many parties
+   * that night gets; a player who is out making noise gets them too, but they
+   * are much less of a surprise when you are not asleep in the room.
+   */
+  hunt: {
+    interval: 95,
+    firstDelay: 70,
+    minCount: 3,
+    maxCount: 6,
+    telegraph: 12,              // seconds of massed groaning before they set off
+  },
+
+  /**
+   * The siege event (night three onward).
+   *
+   * The migration, aimed. A column crosses the map on a line that ends at
+   * whichever shelter you have made yours, and when it arrives it does what
+   * everything else does to a boarded door. It is telegraphed for a long time
+   * because the answer is meant to be a decision — hold, or leave — and not a
+   * reaction.
+   */
+  siege: {
+    fromNight: 3,               // introduced on night three, and it never leaves
+    telegraph: 26,
+    minCount: 9,
+    maxCount: 15,
+    earliestHour: 22.0,
+    spread: 7,
+  },
+
+  /**
+   * The loot economy, day by day.
+   *
+   * The map holds a fixed number of containers, each with a `richness` pool of
+   * rolls rather than a one-shot flag. Emptied containers stay empty; at each
+   * dawn a quarter of them come back with one thin roll in them — scavengers
+   * moved through, rats got at a shelf, you missed a corner in the dark.
+   *
+   * `expectedPerDay` is the design target the self-test measures the real
+   * tables against: supplies (food, water, medicine — anything with a `supply`
+   * value) available versus what a day actually costs. Day one is a glut on
+   * purpose; by day four you are living on what the night before left behind.
+   */
+  economy: {
+    restockChance: 0.25,        // fraction of emptied containers that come back
+    restockLuck: 0.55,          // <1 biases a restocked roll toward "nothing"
+    restockMax: 1,              // items a thin roll can produce
+    dayOneRichness: 1,          // most containers hold exactly one search
+    richContainers: 2,          // …the marked ones hold two
+
+    /**
+     * Supplies available vs. supplies burned, per day.
+     *
+     * `available` is what the map can *yield* that day — day one is every
+     * container on it, every later day is the dawn restock plus whatever you
+     * did not get to. `need` is what a day of thirst and hunger costs in
+     * item-equivalents (one bottle is 42 thirst, one tin is 46 hunger, and a
+     * full day drains 134 and 86 of them).
+     *
+     * These numbers are computed from the real loot tables by
+     * `__H.economy()`, and the metagame self-test asserts this table against
+     * that computation — so if you retune a table, this goes stale loudly
+     * rather than quietly.
+     *
+     * The shape is the design: day one is seven days of food lying on the
+     * floor and no way to carry it, which is what the stash is for. From day
+     * three the map cannot feed you and you are living on what you hoarded.
+     */
+    expectedPerDay: [
+      { day: 1, available: 34, need: 3, note: 'half a day, and everything is still on the shelves' },
+      { day: 2, available: 12, need: 5, note: 'the restock, plus everywhere you did not reach' },
+      { day: 3, available: 4, need: 5, note: 'net negative — the stash starts going down' },
+      { day: 4, available: 3, need: 5, note: 'the map is empty. You are eating yesterday.' },
+      { day: 5, available: 3, need: 5, note: 'three hours of road, or a night you cannot afford' },
+    ],
+  },
+
+  /**
+   * Base building.
+   *
+   * Three fortification tiers per opening, two traps, a stash and a generator.
+   * The numbers are all about the same question — how many planks do you have
+   * and which door do you spend them on — so the tiers are deliberately
+   * expensive rather than deliberately strong.
+   */
+  base: {
+    /**
+     * Fortification tiers, in order. `hpMul` multiplies the opening's own max
+     * HP to get the barricade layer's HP, so a reinforced house door carries
+     * 300 × 4.4 = 1320 on top of its own 300, and a metal-sheeted one 2640.
+     * Against three shamblers (~30 dps pooled) that is 25 s bare, 45 s
+     * planked, 88 s reinforced and 160 s sheeted.
+     */
+    fortify: [
+      { id: 'planks', name: 'Planks', cost: { planks: 1 }, refund: 'planks', hpMul: 2.0, time: 2.6 },
+      { id: 'reinforced', name: 'Reinforced', cost: { planks: 1, tools: 1 }, refund: 'planks', hpMul: 4.4, time: 4.2 },
+      { id: 'metal', name: 'Metal sheet', cost: { metal_sheet: 1 }, refund: 'metal_sheet', hpMul: 8.8, time: 5.0 },
+    ],
+
+    /**
+     * Taking a barricade back off. Quicker than putting it on, far louder, and
+     * it gives the materials back — a reinforced frame returns the planks but
+     * not the tool roll, which is the small tax that stops board/unboard being
+     * a way to store wood.
+     *
+     * This is not a convenience. Without it, boarding the safehouse door — the
+     * thing the day-one objective explicitly tells you to do — seals the last
+     * opening in a building whose four windows ship boarded, and the run ends
+     * in a locked room.
+     */
+    unboardTime: 2.2,
+    unboardNoise: 18,
+
+    /** Boarding over a hole someone already came through costs more wood. */
+    repairPlankCost: 2,
+    repairTime: 4.0,
+
+    /**
+     * The nailboard. A plank with six nails through it, laid in a doorway.
+     * Whatever comes through loses a leg to it — which does not kill anything,
+     * but a crawler at ankle height in a doorway you know about is a very
+     * different problem from a shambler in it.
+     */
+    nailboard: {
+      craft: { planks: 1, nails: 1 },
+      craftTime: 3.0,
+      damage: 24,
+      cripple: true,
+      uses: 6,                  // it bends flat, and then it is a plank again
+      rearmTime: 1.4,           // beat between triggers, so a crowd files onto it
+      radius: 1.3,
+      noise: 9,
+    },
+
+    /**
+     * Alarm cans. String across a gap, cans hung off it. It does nothing to
+     * anything — it just tells you which way to look, ten seconds before you
+     * would have found out the hard way. Early warning is the whole fantasy.
+     */
+    alarm: {
+      craft: { tin_can: 2, string: 1 },
+      craftTime: 2.0,
+      radius: 6.5,
+      cooldown: 11,
+      noise: 12,                // it is a noise: it draws them too
+      uses: 8,
+      pingTime: 6.0,            // seconds the HUD bearing stays up
+    },
+
+    /**
+     * The generator. Fuel in, light and comfort out, and a noise floor that
+     * never stops for as long as it runs. Every metre of visibility it buys
+     * you is bought with the street knowing exactly where you are.
+     */
+    generator: {
+      fuelPerCan: 240,          // seconds of run time in one fuel can
+      maxFuel: 720,
+      noise: 26,                // metres, emitted continuously
+      noiseInterval: 0.55,
+      pressure: 0.055,          // straight into the director's meter, per second
+      lightIntensity: 150,
+      lightRange: 34,
+      startNoise: 34,           // the pull-start is much louder than the idle
+    },
+
+    /** The stash. Weight rather than slots, and far more of it than you carry. */
+    stash: { maxWeight: 120, maxSlots: 40 },
+  },
+
+  /**
+   * The radio.
+   *
+   * A battery set on the kitchen table that catches one fragment each dawn.
+   * It is the only exposition in the game and it is deliberately unreliable:
+   * it hisses on its own when there is something to hear, and the objective
+   * line says so. Nothing about the campaign is ever explained by a menu.
+   */
+  radio: {
+    playTime: 9.0,              // seconds a fragment takes to get out
+    firstDay: 2,
+    // How far the carrier wave carries lives with the sound, in AudioSys —
+    // that file takes no config by design and owns every other rolloff too.
   },
 
   camera: {
@@ -248,7 +521,16 @@ export const CFG = {
     alertRadius: 17,          // how far a zombie's shriek carries to others
     nightSpeedMul: 1.16,
     nightAggroMul: 1.22,
-    maxActive: 46,
+    /**
+     * Hard ceiling on bodies in the world.
+     *
+     * Night five's population target is `targetNight × 1.85` = 56, so a cap of
+     * 46 would silently clip the last two nights back to the same crowd as
+     * night three and quietly delete the top of the escalation curve. 58 gives
+     * the curve room to actually arrive; the AI suite's soak runs 60 and holds
+     * frame time, which is where the headroom number comes from.
+     */
+    maxActive: 58,
 
     /**
      * AI level of detail. Past `lodDistance` a zombie stops being something you
@@ -500,9 +782,8 @@ export const CFG = {
     doorHp: 300,
     doorDps: 12,              // per zombie of average strength (archetype damage 14)
     siegeCrowdExp: 0.9,       // n attackers deal n^exp times one attacker's damage
-    boardHpMul: 2.0,          // boards carry 2x the door on top of it → 3x total
+    boardHpMul: 2.0,          // fallback only; CFG.base.fortify owns the tiers
     windowHp: 150,
-    boardPlankCost: 1,
 
     swingTime: 0.42,
     slamTime: 0.15,
@@ -596,6 +877,25 @@ export const CFG = {
   loot: {
     searchTimeBase: 1.5,
     scarcityDay: 1.0,
+    /**
+     * Luck decays across the run. The same shelf that gave you beans on day
+     * one is being searched for the fifth time by day five, and the tables do
+     * not need rewriting to say so.
+     */
+    luckPerDay: [1.15, 1.0, 0.92, 0.84, 0.78],
+  },
+
+  /**
+   * Night four: the grid finally goes.
+   *
+   * Streetlights die, the fog thickens, and the only lights left on the map
+   * are the ones somebody is running — which is the night the generator stops
+   * being a luxury and starts being a decision.
+   */
+  blackout: {
+    fogMul: 2.15,
+    fogRamp: 12,                // seconds it takes to close in
+    warnAt: 21.6,               // the hour the lights go out
   },
 
   ui: {

@@ -22,11 +22,18 @@
           <div id="obj-sub"></div>
         </div>
 
-        <!-- top-right: clock + day -->
+        <!-- top-right: clock + which day of the run this is -->
         <div id="clock-panel">
           <div id="clock-time">--:--</div>
           <div id="clock-phase">—</div>
+          <div id="clock-day">DAY 1</div>
         </div>
+
+        <!-- a bearing, and nothing else: what the alarm cans buy you -->
+        <div id="alarm-layer"></div>
+
+        <!-- the only chapter marker in the game -->
+        <div id="day-banner"></div>
 
         <!-- bottom-left: vitals -->
         <div id="vitals">
@@ -109,6 +116,12 @@
           </div>
           <div class="inv-body">
             <div id="inv-grid"></div>
+            <!-- the stash: only ever visible while you are standing at a box -->
+            <div id="stash-panel" class="hidden">
+              <div class="stash-head"><span id="stash-title">STASH</span><span id="stash-weight">0/0</span></div>
+              <div id="stash-grid"></div>
+              <div class="stash-hint">click to move · [Q] moves the selected slot</div>
+            </div>
             <div id="inv-detail">
               <div id="inv-detail-name">—</div>
               <div id="inv-detail-desc">Select an item.</div>
@@ -136,10 +149,13 @@
             Find what you can before dark, and get somewhere with a door that locks.
           </p>
           <button id="btn-start">BEGIN</button>
+          <button id="btn-continue" class="hidden">CONTINUE</button>
+          <div id="continue-line" class="hidden"></div>
           <div class="controls-hint">
             <div><b>WASD</b> move · <b>SHIFT</b> sprint · <b>SPACE</b> jump · <b>MOUSE</b> look</div>
             <div><b>LMB</b> attack · <b>RMB</b> block · <b>E</b> interact/search · <b>F</b> flashlight</div>
-            <div><b>TAB</b> inventory · <b>1-9</b> quick-use · <b>ESC</b> release cursor</div>
+            <div><b>G</b> nailboard in a doorway · <b>B</b> alarm cans · <b>TAB</b> inventory</div>
+            <div><b>1-9</b> quick-use · <b>ESC</b> release cursor</div>
           </div>
           <div class="warn">Uses audio. Click BEGIN to enable sound.</div>
         </div>
@@ -156,10 +172,10 @@
 
       <div id="screen-win" class="screen hidden">
         <div class="win-inner">
-          <h1>DAWN</h1>
-          <p id="win-text">You made it through the first night.</p>
+          <h1 id="win-title">EXTRACTED</h1>
+          <p id="win-text">You made it onto the road.</p>
           <div id="win-stats"></div>
-          <button id="btn-again">PLAY AGAIN</button>
+          <button id="btn-again">NEW RUN</button>
         </div>
       </div>
 

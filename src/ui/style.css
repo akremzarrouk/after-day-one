@@ -1012,3 +1012,139 @@ canvas#scene {
   color: var(--ink);
   cursor: pointer;
 }
+
+/* ═══════════════════════════════════════════════════ metagame ══ */
+
+/* Which day of the run this is. Sits under the clock, in the same voice as
+   the phase line, because it is the same kind of fact. */
+#clock-day {
+  font-family: var(--font-disp);
+  font-size: 11px;
+  letter-spacing: 0.26em;
+  color: var(--ink-dim);
+  margin-top: 6px;
+  opacity: 0.85;
+}
+
+#clock-day.night {
+  color: #b8563f;
+  opacity: 1;
+}
+
+/* The chapter marker: one word, once a morning. */
+#day-banner {
+  position: absolute;
+  left: 50%;
+  top: 27%;
+  transform: translate(-50%, -50%) scale(1.06);
+  font-family: var(--font-disp);
+  font-size: 46px;
+  letter-spacing: 0.4em;
+  color: var(--ink);
+  text-shadow: 0 2px 18px #000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.9s ease, transform 1.6s ease;
+}
+
+#day-banner.show {
+  opacity: 0.92;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* Alarm bearings. Same ring as the threat wedges, different colour: this is
+   something you built telling you something, not something hunting you. */
+#alarm-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.alarm-ping {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+}
+
+.alarm-ping i {
+  position: absolute;
+  display: block;
+  width: 26px;
+  height: 3px;
+  background: rgba(216, 178, 90, 0.9);
+  box-shadow: 0 0 12px rgba(216, 178, 90, 0.55);
+  transform: translate(-13px, 0);
+  animation: alarm-pulse 0.9s ease-in-out infinite;
+}
+
+.alarm-ping.siege i {
+  width: 40px;
+  height: 4px;
+  background: rgba(190, 45, 34, 0.92);
+  box-shadow: 0 0 16px rgba(190, 45, 34, 0.6);
+  transform: translate(-20px, 0);
+}
+
+@keyframes alarm-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+/* ───────────────────────────────────────────────────────── the stash ── */
+
+/* The box sits between the pack and the detail panel, so the inventory
+   window becomes two grids and a line down the middle when you are standing
+   at one, and is exactly what it was when you are not. */
+#inventory.with-stash .inv-body {
+  grid-template-columns: 1fr 1fr 250px;
+}
+
+#stash-panel {
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+}
+
+.stash-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 14px 0;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--ink-dim);
+}
+
+#stash-grid {
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  align-content: start;
+  overflow-y: auto;
+  max-height: 300px;
+}
+
+.stash-hint {
+  padding: 0 14px 12px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--ink-dim);
+  opacity: 0.7;
+}
+
+/* ────────────────────────────────────────────────── title: continue ── */
+
+#btn-continue {
+  margin-top: 10px;
+}
+
+#continue-line {
+  margin-top: 8px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--ink-dim);
+  opacity: 0.8;
+}

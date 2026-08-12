@@ -49,6 +49,23 @@ export class Fire {
   }
 
   /**
+   * Show the light pool without lighting anything, so the renderer can be
+   * asked to compile the shaders for "fire is burning" before any fire is.
+   *
+   * three.js bakes the light count into every material's program, and a light
+   * with `visible = false` is not counted — so the frame a molotov lands is
+   * the frame every material in the scene recompiles. Measured at 150–220 ms
+   * on this map, which is a visible lurch at exactly the worst moment. Warming
+   * it at load costs nothing anybody sees.
+   */
+  warmLights(on) {
+    for (const l of this._lights) {
+      l.visible = on;
+      l.intensity = 0;
+    }
+  }
+
+  /**
    * Light a patch of road.
    *
    * @returns the pool, or the recycled one if we were already at the cap.

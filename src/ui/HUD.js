@@ -5,7 +5,7 @@
 
 import { ITEMS, ItemType, WEAPONS } from '../systems/Items.js';
 import { conditionTier } from '../systems/Inventory.js';
-import { clamp01 } from '../core/Utils.js';
+import { clamp01, angleDelta } from '../core/Utils.js';
 import CFG from '../core/Config.js';
 
 const $ = (id) => document.getElementById(id);
@@ -20,6 +20,16 @@ export class HUD {
       clockTime: $('clock-time'),
       clockPhase: $('clock-phase'),
       clockPanel: $('clock-panel'),
+      clockDay: $('clock-day'),
+      alarmLayer: $('alarm-layer'),
+      dayBanner: $('day-banner'),
+      stashPanel: $('stash-panel'),
+      stashGrid: $('stash-grid'),
+      stashTitle: $('stash-title'),
+      stashWeight: $('stash-weight'),
+      winTitle: $('win-title'),
+      btnContinue: $('btn-continue'),
+      continueLine: $('continue-line'),
       barHealth: $('bar-health'),
       barStamina: $('bar-stamina'),
       barThirst: $('bar-thirst'),
@@ -76,6 +86,15 @@ export class HUD {
     this.threatArrows = [];
     this.noteOpen = false;
     this._lastInvSig = '';
+
+    // ── metagame ──
+    this.stash = null;
+    this.selectedStashSlot = 0;
+    this._lastStashSig = '';
+    this.bannerTimer = 0;
+    /** Live alarm bearings: { angle, kind, t, life }. */
+    this.alarmPings = [];
+    this.alarmNodes = [];
   }
 
   // ─────────────────────────────────────────────────────────── screens ──
@@ -89,9 +108,23 @@ export class HUD {
     this.el.screenLoading.classList.add('hidden');
   }
 
-  showTitle() {
+  /**
+   * @param save  `{ day, hour, night }` from a stored run, or null. CONTINUE
+   *              only appears when there is genuinely something to go back to.
+   */
+  showTitle(save = null) {
     this.el.screenTitle.classList.remove('hidden');
     this.el.hud.classList.add('hidden');
+    const has = !!save;
+    this.el.btnContinue?.classList.toggle('hidden', !has);
+    this.el.continueLine?.classList.toggle('hidden', !has);
+    if (has && this.el.continueLine) {
+      const h = Math.floor(save.hour);
+      const m = Math.round((save.hour - h) * 60);
+      this.el.continueLine.textContent =
+        `day ${save.day} · ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} · ` +
+        `${save.night} night${save.night === 1 ? '' : 's'} behind you`;
+    }
   }
 
   hideTitle() {
@@ -111,11 +144,66 @@ export class HUD {
     this.el.hud.classList.remove('hidden');
   }
 
-  showWin(text, stats) {
+  showWin(text, stats, title = 'DAWN') {
+    if (this.el.winTitle) this.el.winTitle.textContent = title;
     this.el.winText.innerHTML = text;
     this.el.winStats.innerHTML = stats;
     this.el.screenWin.classList.remove('hidden');
     this.el.hud.classList.add('hidden');
+  }
+
+  // ────────────────────────────────────────────────────────── metagame ──
+
+  /**
+   * The chapter marker. One word, three seconds, once a morning — the only
+   * time the HUD ever takes the middle of the screen for something that is
+   * not a threat.
+   */
+  flashDay(day) {
+    if (!this.el.dayBanner) return;
+    this.el.dayBanner.textContent = `DAY ${day}`;
+    this.el.dayBanner.classList.add('show');
+    this.bannerTimer = 3.2;
+  }
+
+  /**
+   * A bearing on the ring, and nothing else.
+   *
+   * This is the entire product the alarm cans sell: not what it is, not how
+   * many, not how far — which way to look. Deliberately the same visual
+   * language as the threat wedges so it reads instantly, in a colour that
+   * says "you set this up" rather than "you are being hunted".
+   *
+   * `world` is a compass bearing, not a screen angle, and it is converted to
+   * one every frame against the live camera yaw — a marker that says "over
+   * there" has to keep meaning it while you turn to look, which is the entire
+   * reason you set the wire up.
+   */
+  pingAlarm(world, kind = 'alarm', life = 6) {
+    this.alarmPings.push({ world, kind, t: 0, life });
+    while (this.alarmPings.length > 4) this.alarmPings.shift();
+  }
+
+  get stashOpen() {
+    return !!this.stash;
+  }
+
+  openStash(stash, title = 'STASH') {
+    this.stash = stash;
+    this.selectedStashSlot = 0;
+    this._lastStashSig = '';
+    if (this.el.stashTitle) this.el.stashTitle.textContent = title.toUpperCase();
+    this.el.stashPanel?.classList.remove('hidden');
+    this.el.inventory.classList.add('with-stash');
+    this.openInventory();
+    this.renderStash();
+  }
+
+  closeStash() {
+    this.stash = null;
+    this.el.stashPanel?.classList.add('hidden');
+    this.el.inventory.classList.remove('with-stash');
+    this.closeInventory();
   }
 
   hideWin() {
@@ -243,12 +331,30 @@ export class HUD {
         <span class="qty">${slot.count > 1 ? '×' + slot.count : ''}</span>
         <div class="ico">${def.icon}</div>
         <div class="nm">${def.short}</div>`;
+      /**
+       * With a box open, one click is a transfer. That is the whole reason a
+       * chest UI exists, and making the player select-then-press-a-button
+       * would be a menu where an action belongs.
+       */
       d.onclick = () => {
+        if (this.stashOpen) {
+          // Select as well as transfer, so [Q] afterwards acts on the slot the
+          // player last touched rather than on whatever slot 0 happens to be.
+          this.selectedSlot = i;
+          this.game.stashDeposit(i);
+          this._lastInvSig = '';
+          this._lastStashSig = '';
+          this.renderInventory();
+          this.renderStash();
+          return;
+        }
         this.selectedSlot = i;
         this._lastInvSig = '';
         this.renderInventory();
       };
-      d.ondblclick = () => this.game.useSlot(i);
+      d.ondblclick = () => {
+        if (!this.stashOpen) this.game.useSlot(i);
+      };
       grid.appendChild(d);
     }
 
@@ -314,6 +420,54 @@ export class HUD {
     this.el.invWt.textContent = `${inv.weight.toFixed(1)}/${inv.maxWeight}`;
   }
 
+  /**
+   * The other half of the box.
+   *
+   * Same slot markup as the pack so the two grids read as one space with a
+   * line down the middle, and the only number on it is weight — because the
+   * only question a stash ever answers is "is there room".
+   */
+  renderStash() {
+    const st = this.stash;
+    if (!st || !this.el.stashGrid) return;
+    const sig =
+      st.slots.map((x) => x.id + x.count + (x.cond === undefined ? '' : x.cond.toFixed(2))).join('|') +
+      '#' + this.selectedStashSlot;
+    if (sig === this._lastStashSig) return;
+    this._lastStashSig = sig;
+
+    const grid = this.el.stashGrid;
+    grid.innerHTML = '';
+    const total = Math.max(18, st.slots.length + 2);
+    for (let i = 0; i < total; i++) {
+      const slot = st.slots[i];
+      const d = document.createElement('div');
+      if (!slot) {
+        d.className = 'inv-slot empty';
+        grid.appendChild(d);
+        continue;
+      }
+      const def = ITEMS[slot.id];
+      d.className = `inv-slot${this.selectedStashSlot === i ? ' sel' : ''}`;
+      d.innerHTML = `
+        <span class="qty">${slot.count > 1 ? '×' + slot.count : ''}</span>
+        <div class="ico">${def.icon}</div>
+        <div class="nm">${def.short}</div>`;
+      d.onclick = () => {
+        this.selectedStashSlot = i;
+        this.game.stashWithdraw(i);
+        this._lastInvSig = '';
+        this._lastStashSig = '';
+        this.renderInventory();
+        this.renderStash();
+      };
+      grid.appendChild(d);
+    }
+    if (this.el.stashWeight) {
+      this.el.stashWeight.textContent = `${st.weight.toFixed(1)}/${st.maxWeight} kg`;
+    }
+  }
+
   // ───────────────────────────────────────────────────────────── update ──
 
   update(dt, s) {
@@ -323,10 +477,15 @@ export class HUD {
     el.objText.textContent = s.objectiveTitle;
     el.objSub.textContent = s.objectiveSub;
 
-    // clock
+    // clock — the run's phase name, not the sky's, so DAWN reads as the grace
+    // window it actually is rather than as a lighting condition
     el.clockTime.textContent = s.clock;
-    el.clockPhase.textContent = s.phase;
+    el.clockPhase.textContent = s.runPhase || s.phase;
     el.clockPanel.classList.toggle('night', s.night);
+    if (el.clockDay) {
+      el.clockDay.textContent = s.runPhase === 'NIGHT' ? `NIGHT ${s.nightNo}` : `DAY ${s.day}`;
+      el.clockDay.classList.toggle('night', s.runPhase === 'NIGHT');
+    }
 
     // vitals
     const sv = s.survival;
@@ -396,8 +555,53 @@ export class HUD {
     }
 
     this._renderThreat(s);
+    this._renderAlarms(dt, s);
+
+    if (this.bannerTimer > 0) {
+      this.bannerTimer -= dt;
+      if (this.bannerTimer <= 0) el.dayBanner?.classList.remove('show');
+    }
 
     if (this.inventoryOpen) this.renderInventory();
+    if (this.stashOpen) this.renderStash();
+  }
+
+  /**
+   * Alarm bearings. Same ring as the threat wedges and deliberately so — but
+   * these fade over six seconds instead of tracking, because what a wire of
+   * cans knows is where something *was*, once.
+   */
+  _renderAlarms(dt, s) {
+    const layer = this.el.alarmLayer;
+    if (!layer) return;
+    const camYaw = s?.camYaw || 0;
+    for (let i = this.alarmPings.length - 1; i >= 0; i--) {
+      this.alarmPings[i].t += dt;
+      if (this.alarmPings[i].t >= this.alarmPings[i].life) this.alarmPings.splice(i, 1);
+    }
+    while (this.alarmNodes.length < this.alarmPings.length) {
+      const d = document.createElement('div');
+      d.className = 'alarm-ping';
+      d.innerHTML = '<i></i>';
+      layer.appendChild(d);
+      this.alarmNodes.push(d);
+    }
+    for (let i = 0; i < this.alarmNodes.length; i++) {
+      const n = this.alarmNodes[i];
+      const p = this.alarmPings[i];
+      if (!p) {
+        n.style.display = 'none';
+        continue;
+      }
+      n.style.display = 'block';
+      n.className = `alarm-ping ${p.kind}`;
+      const r = Math.min(window.innerWidth, window.innerHeight) * 0.36;
+      // Compass bearing → screen bearing, against wherever the camera is now.
+      // Same sign convention as the threat wedges, so the two rings agree.
+      const rel = -angleDelta(camYaw, p.world);
+      n.style.transform = `rotate(${rel}rad) translate(0px, ${-r}px)`;
+      n.style.opacity = String(clamp01(1 - p.t / p.life) * 0.95);
+    }
   }
 
   /**
@@ -468,7 +672,13 @@ export class HUD {
     if (sv.painkiller > 0) chips.push(['good', 'PAINKILLERS']);
     if (s.flashlightOn) chips.push(['good', `TORCH ${Math.ceil(s.battery)}s`]);
     if (s.indoors) chips.push(['good', 'INDOORS']);
-    if (s.barricaded) chips.push(['good', 'DOOR BOARDED']);
+    if (s.sealed) chips.push(['good', 'SEALED']);
+    else if (s.barricaded) chips.push(['good', 'DOOR BOARDED']);
+    if (s.generator?.running) {
+      chips.push(['warn', `GENERATOR ${Math.floor(s.generator.fuel / 60)}:${String(Math.floor(s.generator.fuel % 60)).padStart(2, '0')}`]);
+    }
+    if (s.radioSignal) chips.push(['', 'SIGNAL']);
+    if (s.blackout > 0.5) chips.push(['bad', 'NO POWER']);
     if (s.crouching) chips.push(['', s.concealed ? 'HIDDEN · CROUCHED' : 'CROUCHED']);
     if (s.hiddenIn) chips.push(['good', s.hiddenIn.toUpperCase()]);
 

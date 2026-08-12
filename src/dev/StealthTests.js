@@ -425,12 +425,20 @@ class Harness {
     g.objectives.onBarricade();
     await H.wait(300);
 
+    /**
+     * Hold to dawn. Since the metagame pass this is no longer a win screen —
+     * surviving night one rolls the run over into day two — so what is
+     * asserted is the handover: the day counter turns, the run is still
+     * alive, and the objective line has stopped talking about supplies and
+     * started talking about the second day.
+     */
+    const dayBefore = g.run.day;
     H.setHour(5.6);
     await H.wait(300);
     g.time.paused = false;
     g.time.timeScale = 60;
     const t0 = this.sim;
-    while (this.sim - t0 < 25 && g.state === 'playing') {
+    while (this.sim - t0 < 25 && g.run.day === dayBefore && g.state === 'playing') {
       await H.wait(120);
       g.survival.health = 100;
       g.survival.thirst = 80;
@@ -438,16 +446,20 @@ class Harness {
     }
     g.time.timeScale = 1;
     await this.shot('i_objective');
-    this.record('h · the gather → return → survive chain still completes', g.state === 'win', {
-      afterGather: gathered,
-      afterReturn: returned,
-      boarded,
-      finalGoal: obj.goal,
-      gameState: g.state,
-      hour: +g.time.hour.toFixed(2),
-    });
-    // Leave the game somewhere sane for whoever looks next.
-    g.hud.hideWin();
-    g.state = 'playing';
+    this.record(
+      'h · the gather → return → survive chain hands night one over to day two',
+      g.run.day === dayBefore + 1 && g.run.state === 'alive' && g.state === 'playing',
+      {
+        afterGather: gathered,
+        afterReturn: returned,
+        boarded,
+        finalGoal: obj.goal,
+        objective: obj.title,
+        gameState: g.state,
+        day: g.run.day,
+        nightsSurvived: g.run.nightsSurvived,
+        hour: +g.time.hour.toFixed(2),
+      }
+    );
   }
 }
